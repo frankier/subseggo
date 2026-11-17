@@ -1,5 +1,6 @@
 /.envrc
 /work/
+/work-docker/
 /proto/
 __pycache__/
 *.mp4

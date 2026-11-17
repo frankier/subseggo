@@ -51,6 +51,11 @@ docker run --rm \
     yt-segment "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
+With rootless podman on an SELinux system the bind mount needs a relabel
+(`-v "$PWD/work:/work/work:Z"`); otherwise the container cannot write into it.
+The pipeline was tested end-to-end in this image (download → Voxtral
+transcription → pi segmentation → editlist → mp4 + mov_text outputs).
+
 The image is `debian:bookworm-slim` + ffmpeg + Node 22 (official tarball; pi needs
 ≥ 22.19, yt-dlp uses it as JS runtime) + `uv` + `pi` (`npm i -g
 @earendil-works/pi-coding-agent@1.5.2`). Entrypoint is
