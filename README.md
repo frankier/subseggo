@@ -38,8 +38,26 @@ uv run --script pipeline.py "https://www.youtube.com/watch?v=VIDEO_ID" \
 Requirements on PATH: `uv`, `ffmpeg`, `ffprobe`, `pi`, `node` (yt-dlp JS runtime).
 Options: `--language en`, `--subs embed|burn|sidecar`, `--reencode`,
 `--transcribe-model`, `--segment-model`, `--effort`, `--chunk-minutes`,
-`--skip-download/--skip-transcribe/--skip-segment` (resume), `--mock-transcript`,
-`--mock-segments` (offline testing). See `--help`.
+`--skip-download/--skip-transcribe/--skip-segment/--skip-edit`, `--force-edit`,
+`--mock-transcript`, `--mock-segments` (offline testing). See `--help`.
+
+## Retries and resuming a partial run
+
+- Each transcription chunk is retried on HTTP 5xx/429/network errors with
+  exponential backoff + jitter: `--max-retries 5 --retry-base-seconds 2
+  --retry-max-seconds 120` (2s, 4s, 8s, … capped at 120s). Other 4xx errors are
+  fatal immediately.
+- Every finished chunk's API result is cached atomically in
+  `workdir/chunks/chunk-NNN.json`. If a run dies (e.g. a persistent 520 on the last
+  chunk), just **re-run the same command**: finished chunks are loaded from cache
+  and only the missing ones are re-requested. Same for the other stages:
+  `raw.mp4`, `transcript.json`, `segments.json` and the `.edit-done` marker make
+  download/transcribe/segment/edit resumable; `--skip-*` forces skipping a stage
+  and `--force-edit` redoes the edit stage.
+- Test the retry/resume logic offline against a mock API:
+  `tests/mock_mistral_server.py` (env `FAIL_FIRST=N` fails the first N requests
+  with 520, `FAIL_FILE` fails while the file exists), then run with
+  `MISTRAL_API_BASE=http://127.0.0.1:8799/v1 MISTRAL_API_KEY=dummy ...`.
 
 ## Run in Docker
 

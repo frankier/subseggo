@@ -11,7 +11,12 @@
 """
 YouTube -> subtitles -> hierarchical segmentation -> editlist -> mp4 outputs.
 
-Pipeline stages (each resumable via --skip-*):
+Pipeline stages (resumable: re-run the same command after a failure — finished
+downloads, per-chunk transcription results (workdir/chunks/), segmentation and
+edit stages are all cached/skipped automatically):
+  - transcription chunks retry 5xx/429/network errors with exponential backoff
+    (--max-retries, --retry-base-seconds, --retry-max-seconds); stages can also be
+    skipped explicitly via --skip-download/--skip-transcribe/--skip-segment/--skip-edit.
   1. download    : yt-dlp grabs the YouTube video as raw.mp4 (+ raw.info.json)
   2. transcribe  : audio chunks -> Mistral /v1/audio/transcriptions (Voxtral-3-small)
                    -> transcript.json (segments) + raw.srt
@@ -33,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -137,24 +143,42 @@ def extract_audio_chunk(raw_mp4: Path, start: float, dur: float, out: Path) -> N
 
 
 def transcribe_chunk(mp3: Path, model: str, language: str | None, api_key: str,
-                     timeout: int = 3600) -> list[dict]:
-    files = {"file": (mp3.name, open(mp3, "rb"), "audio/mpeg")}
+                     max_retries: int = 5, retry_base: float = 2.0,
+                     retry_max: float = 120.0, timeout: int = 3600) -> list[dict]:
+    """POST one audio chunk to /v1/audio/transcriptions, retrying 5xx/429/network
+    errors with exponential backoff + jitter. 4xx (other than 429) is fatal."""
     data = {"model": model, "timestamp_granularities": "segment", "stream": "false"}
     if language:
         data["language"] = language
-    r = requests.post(f"{MISTRAL_API_BASE}/audio/transcriptions",
-                      headers={"Authorization": f"Bearer {api_key}"},
-                      files=files, data=data, timeout=timeout)
-    if r.status_code != 200:
-        sys.exit(f"ERROR: transcription failed ({r.status_code}): {r.text[:2000]}")
-    body = r.json()
-    segs = body.get("segments") or []
-    out = []
-    for s in segs:
-        out.append({"start": float(s["start"]), "end": float(s["end"]),
-                    "text": s.get("text", ""), "speaker_id": s.get("speaker_id")})
-    log(f"  chunk {mp3.name}: {len(out)} segments, usage={body.get('usage')}")
-    return out
+    last_err = ""
+    for attempt in range(1, max_retries + 1):
+        try:
+            with open(mp3, "rb") as fh:
+                files = {"file": (mp3.name, fh, "audio/mpeg")}
+                r = requests.post(f"{MISTRAL_API_BASE}/audio/transcriptions",
+                                  headers={"Authorization": f"Bearer {api_key}"},
+                                  files=files, data=data, timeout=timeout)
+            if r.status_code == 200:
+                body = r.json()
+                segs = body.get("segments") or []
+                out = [{"start": float(s["start"]), "end": float(s["end"]),
+                        "text": s.get("text", ""), "speaker_id": s.get("speaker_id")}
+                       for s in segs]
+                log(f"  chunk {mp3.name}: {len(out)} segments, usage={body.get('usage')}")
+                return out
+            last_err = f"HTTP {r.status_code}: {r.text[:500]}"
+            if r.status_code < 500 and r.status_code != 429:
+                sys.exit(f"ERROR: transcription failed, not retrying ({last_err})")
+        except requests.RequestException as e:
+            last_err = f"network error: {e}"
+        if attempt < max_retries:
+            delay = min(retry_max, retry_base * (2 ** (attempt - 1))) + random.uniform(0, 1.0)
+            log(f"  chunk {mp3.name}: attempt {attempt}/{max_retries} failed ({last_err}); "
+                f"retrying in {delay:.1f}s")
+            time.sleep(delay)
+    sys.exit(f"ERROR: transcription failed after {max_retries} attempts for {mp3.name}: "
+             f"{last_err}\nAlready-completed chunks are cached in {mp3.parent / 'chunks'}; "
+             f"re-run the same command to resume.")
 
 
 def srt_ts(t: float) -> str:
@@ -172,7 +196,9 @@ def write_srt(segments: list[dict], path: Path) -> None:
 
 
 def step_transcribe(workdir: Path, model: str, language: str | None,
-                    chunk_minutes: int, mock_transcript: Path | None) -> list[dict]:
+                    chunk_minutes: int, mock_transcript: Path | None,
+                    max_retries: int = 5, retry_base: float = 2.0,
+                    retry_max: float = 120.0) -> list[dict]:
     transcript_json = workdir / "transcript.json"
     if transcript_json.exists():
         log("transcribe: transcript.json exists, skipping")
@@ -188,25 +214,39 @@ def step_transcribe(workdir: Path, model: str, language: str | None,
         duration = probe_duration(raw_mp4)
         chunk_seconds = chunk_minutes * 60
         overlap = 15.0  # seconds of overlap between chunks to avoid cutting mid-segment
-        all_segments: list[dict] = []
+        cache_dir = workdir / "chunks"   # per-chunk API results -> resumable
+        cache_dir.mkdir(exist_ok=True)
+        # chunk boundaries (deterministic, so cache indexes are stable across runs)
+        boundaries = []
         start = 0.0
-        idx = 0
         while start < duration - 1:
-            dur = min(chunk_seconds, duration - start)
-            chunk = workdir / f"chunk-{idx:03d}.mp3"
-            log(f"transcribe: chunk {idx} [{start:.0f}s +{dur:.0f}s] of {duration:.0f}s")
-            extract_audio_chunk(raw_mp4, start, dur, chunk)
-            segs = transcribe_chunk(chunk, model, language, api_key)
-            for s in segs:
+            boundaries.append((start, min(chunk_seconds, duration - start)))
+            start += chunk_seconds - overlap
+        all_segments: list[dict] = []
+        for idx, (start, dur) in enumerate(boundaries):
+            cache_file = cache_dir / f"chunk-{idx:03d}.json"
+            if cache_file.exists():
+                log(f"transcribe: chunk {idx} [{start:.0f}s +{dur:.0f}s] cached -> {cache_file.name}")
+                raw_segs = json.loads(cache_file.read_text())["segments"]
+            else:
+                chunk = workdir / f"chunk-{idx:03d}.mp3"
+                log(f"transcribe: chunk {idx} [{start:.0f}s +{dur:.0f}s] of {duration:.0f}s")
+                extract_audio_chunk(raw_mp4, start, dur, chunk)
+                raw_segs = transcribe_chunk(chunk, model, language, api_key,
+                                            max_retries=max_retries, retry_base=retry_base,
+                                            retry_max=retry_max)
+                chunk.unlink(missing_ok=True)
+                tmp = cache_file.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"model": model, "segments": raw_segs}))
+                tmp.rename(cache_file)  # atomic: only complete results are cached
+            for s in raw_segs:
+                s = dict(s)
                 s["start"] += start
                 s["end"] += start
                 # drop segments that lie fully inside the overlap tail of this chunk
                 if idx > 0 and s["end"] <= start + overlap:
                     continue
                 all_segments.append(s)
-            chunk.unlink(missing_ok=True)
-            start += chunk_seconds - overlap
-            idx += 1
         all_segments.sort(key=lambda s: s["start"])
         segments = all_segments
     (workdir / "transcript.json").write_text(json.dumps(
@@ -537,6 +577,7 @@ def step_edit(workdir: Path, data: dict, subs: str, reencode: bool, combined: bo
         shutil.copy(raw_mp4, outdir / "original-with-subs.mp4")
         shutil.copy(raw_srt, outdir / "original-with-subs.srt")
     log(f"edit: original-with-subs.mp4 written to {outdir}")
+    (workdir / ".edit-done").write_text(time.strftime("%Y-%m-%dT%H:%M:%S"))
 
 
 # --------------------------------------------------------------------------- #
@@ -568,6 +609,16 @@ def main() -> None:
     ap.add_argument("--skip-download", action="store_true")
     ap.add_argument("--skip-transcribe", action="store_true")
     ap.add_argument("--skip-segment", action="store_true")
+    ap.add_argument("--skip-edit", action="store_true",
+                    help="skip the edit stage even if not done yet")
+    ap.add_argument("--force-edit", action="store_true",
+                    help="redo the edit stage even if the .edit-done marker exists")
+    ap.add_argument("--max-retries", type=int, default=5,
+                    help="per-chunk transcription retry limit (5xx/429/network errors)")
+    ap.add_argument("--retry-base-seconds", type=float, default=2.0,
+                    help="exponential backoff base for transcription retries")
+    ap.add_argument("--retry-max-seconds", type=float, default=120.0,
+                    help="cap for the backoff delay between retries")
     ap.add_argument("--mock-transcript", type=Path, default=None,
                     help="testing: JSON file with {'segments': [...]} instead of API call")
     ap.add_argument("--mock-segments", type=Path, default=None,
@@ -586,7 +637,9 @@ def main() -> None:
 
     if not args.skip_transcribe:
         step_transcribe(workdir, args.transcribe_model, args.language,
-                        args.chunk_minutes, args.mock_transcript)
+                        args.chunk_minutes, args.mock_transcript,
+                        max_retries=args.max_retries, retry_base=args.retry_base_seconds,
+                        retry_max=args.retry_max_seconds)
     else:
         log("transcribe: skipped")
 
@@ -597,7 +650,12 @@ def main() -> None:
         log("segment: skipped")
         data = json.loads((workdir / "segments.json").read_text())
 
-    step_edit(workdir, data, args.subs, args.reencode, combined=not args.no_combined)
+    if args.skip_edit:
+        log("edit: skipped (--skip-edit)")
+    elif (workdir / ".edit-done").exists() and not args.force_edit:
+        log("edit: .edit-done marker exists, skipping (use --force-edit to redo)")
+    else:
+        step_edit(workdir, data, args.subs, args.reencode, combined=not args.no_combined)
     log(f"DONE. Outputs in {(workdir / 'out').resolve()}")
 
 

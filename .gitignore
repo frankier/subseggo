@@ -2,6 +2,7 @@
 /work/
 /work-docker/
 /proto/
+/tests/t*/
 __pycache__/
 *.mp4
 *.srt
