@@ -1,0 +1,8 @@
+work/
+proto/
+*.mp4
+*.srt
+*.json
+!pipeline.py
+__pycache__/
+.venv/

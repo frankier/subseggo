@@ -1,0 +1,7 @@
+/.envrc
+/work/
+/proto/
+__pycache__/
+*.mp4
+*.srt
+*.info.json

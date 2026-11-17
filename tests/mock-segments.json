@@ -1,0 +1,57 @@
+{
+ "days": [
+  {
+   "title": "Day 1",
+   "start": 0,
+   "end": 213,
+   "segments": [
+    {
+     "kind": "icebreaker",
+     "title": "Welcome & icebreaker",
+     "start": 0,
+     "end": 30,
+     "sections": [
+      {
+       "kind": "content",
+       "title": "Welcome",
+       "start": 0,
+       "end": 30
+      }
+     ]
+    },
+    {
+     "kind": "episode",
+     "title": "Main episode",
+     "start": 30,
+     "end": 213,
+     "sections": [
+      {
+       "kind": "content",
+       "title": "Lecture part 1",
+       "start": 30,
+       "end": 90
+      },
+      {
+       "kind": "break",
+       "title": "Coffee break",
+       "start": 90,
+       "end": 110
+      },
+      {
+       "kind": "exercise",
+       "title": "Exercise 1",
+       "start": 110,
+       "end": 150
+      },
+      {
+       "kind": "content",
+       "title": "Exercise review & outro",
+       "start": 150,
+       "end": 213
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}
