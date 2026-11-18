@@ -21,7 +21,9 @@ edit stages are all cached/skipped automatically):
   2. transcribe  : audio chunks -> Mistral /v1/audio/transcriptions (Voxtral-3-small)
                    -> transcript.json (segments) + raw.srt
   3. segment     : `pi` oneshot (Mistral-Large-3, medium effort) over the transcript
-                   -> segments.json (intermediate format: days > segments > sections)
+                   -> segments.json (intermediate format: segments > sections; days are
+                   never guessed -- with --config each video is one day given by the
+                   config entry's title, single-video runs get no day level)
   4. edit        : segments.json -> editlist.yaml -> ffmpeg-editlist (--srt)
                    -> per-segment mp4 outputs with break sections removed,
                       plus the original mp4 with subtitles applied.
@@ -36,6 +38,12 @@ edit stages are all cached/skipped automatically):
 
 Usage:
   uv run --script pipeline.py "https://www.youtube.com/watch?v=VIDEO_ID" [options]
+  uv run --script pipeline.py --config event.toml [options]
+
+With --config, the TOML file lists the day videos of an event as [[days]] entries
+(each with url= or path=, plus an optional title= that names the day); each video
+is processed in its own workdir under workdir_root and treated as that one day.
+See config.example.toml.
 
 Requires on PATH: ffmpeg, ffprobe, pi, imagemagick (compare; lets the segment model
 fine-tune cut points visually) (and node as yt-dlp JS runtime, optional).
@@ -130,6 +138,30 @@ def step_download(url: str, workdir: Path, height: int | None) -> dict:
         sys.exit("ERROR: download finished but raw.mp4 not found")
     log(f"download: {raw_mp4} ({raw_mp4.stat().st_size/1e6:.1f} MB), "
         f"title={info.get('title')!r}, duration={info.get('duration')}s")
+    return info
+
+
+def step_download_local(src: Path, workdir: Path, title: str | None = None) -> dict:
+    """Config mode: use a local video file as the raw input (one pre-cut day)."""
+    raw_mp4 = workdir / "raw.mp4"
+    info_json = workdir / "raw.info.json"
+    if raw_mp4.exists() and info_json.exists():
+        log(f"download: raw.mp4 already exists in {workdir}, skipping")
+        return json.loads(info_json.read_text())
+    if not src.exists():
+        sys.exit(f"ERROR: local video not found: {src}")
+    log(f"download: local file {src} -> {raw_mp4}")
+    shutil.copyfile(src, raw_mp4)
+    info = {
+        "id": slugify(src.stem),
+        "title": title or src.stem,
+        "uploader": "",
+        "description": "",
+        "duration": probe_duration(raw_mp4),
+    }
+    info_json.write_text(json.dumps(info, indent=2))
+    log(f"download: {raw_mp4} ({raw_mp4.stat().st_size/1e6:.1f} MB), title={info['title']!r}, "
+        f"duration={info['duration']}s")
     return info
 
 
@@ -388,19 +420,18 @@ TRANSCRIPT (timestamps are in the original video):
 {transcript}
 
 TASK:
-Segment the video hierarchically into exactly three levels:
-  1. days      - top-level blocks of the recording (e.g. "Day 1"); usually 1 day for a
-                 single recording, more only if the video clearly spans multiple days.
-  2. segments  - level-2 parts inside a day, of kind "icebreaker" or "episode"
-                 (an episode = one main session/talk of the day).
-  3. sections  - level-3 parts inside a segment: the parts of an episode before/after an
+{day_mode}
+Segment the video hierarchically into exactly two levels:
+  1. segments  - top-level parts of the video, of kind "icebreaker" or "episode"
+                 (an episode = one main session/talk).
+  2. sections  - parts inside a segment: the parts of an episode before/after an
                  exercise, the exercise itself, and the break time itself.
                  Each section has kind: "content" | "exercise" | "break".
                  "break" sections are the break/lunch times that should be REMOVED.
 
 RULES:
 - All times are in SECONDS in the original video (numbers, not strings).
-- days/segments/sections must be contiguous and non-overlapping; sections must exactly
+- segments/sections must be contiguous and non-overlapping; sections must exactly
   partition their parent segment (section.start == previous section.end).
 - Anchor every boundary first to a transcript timestamp (use the timestamp of the
   line where the topic changes). Round to whole seconds. After visual fine-tuning,
@@ -440,21 +471,14 @@ OUTPUT FORMAT: reply with exactly one fenced ```json code block and nothing else
 conforming to this schema:
 ```json
 {{
-  "days": [
+  "segments": [
     {{
-      "title": "Day 1",
+      "kind": "icebreaker" | "episode",
+      "title": "...",
       "start": 0,
-      "end": 12345,
-      "segments": [
-        {{
-          "kind": "icebreaker" | "episode",
-          "title": "...",
-          "start": 0,
-          "end": 5400,
-          "sections": [
-            {{"kind": "content" | "exercise" | "break", "title": "...", "start": 0, "end": 1800}}
-          ]
-        }}
+      "end": 5400,
+      "sections": [
+        {{"kind": "content" | "exercise" | "break", "title": "...", "start": 0, "end": 1800}}
       ]
     }}
   ]
@@ -468,7 +492,8 @@ def fmt_hms(t: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def build_segment_prompt(workdir: Path, segments: list[dict]) -> str:
+def build_segment_prompt(workdir: Path, segments: list[dict],
+                         day_title: str | None = None) -> str:
     info = json.loads((workdir / "raw.info.json").read_text())
     duration = probe_duration(workdir / "raw.mp4")
     # compact transcript: [hh:mm:ss] text
@@ -478,7 +503,18 @@ def build_segment_prompt(workdir: Path, segments: list[dict]) -> str:
         if text:
             lines.append(f"[{fmt_hms(s['start'])}] {text}")
     transcript = "\n".join(lines)
+    if day_title is None:
+        day_mode = ""
+    else:
+        # config mode: this video is one pre-cut day of a multi-day event. The day
+        # is given by the caller -- do not create, guess or label day boundaries.
+        day_mode = (
+            f'CONTEXT: this video is "{day_title}" of a multi-day event. The day is '
+            f'already determined -- do NOT create, guess or label day boundaries; '
+            f'segment only the segments/sections within this video.\n'
+        )
     return SEGMENT_PROMPT.format(
+        day_mode=day_mode,
         title=info.get("title", ""), uploader=info.get("uploader", ""),
         duration=duration, duration_hms=fmt_hms(duration),
         description=(info.get("description") or "")[:8000],
@@ -494,17 +530,21 @@ def pi_supports_effort(pi_bin: str) -> bool:
 
 
 def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
-                 mock_segments: Path | None) -> dict:
+                 mock_segments: Path | None, day_title: str | None = None) -> dict:
+    """Segment one video into segments > sections. day_title (config mode only) is
+    the day this video belongs to, given by the caller -- passed to the prompt as
+    context; the model never guesses days."""
     segments_json = workdir / "segments.json"
     if segments_json.exists():
         log("segment: segments.json exists, skipping")
         return json.loads(segments_json.read_text())
+    duration = probe_duration(workdir / "raw.mp4")
     if mock_segments:
         log(f"segment: using mock segments {mock_segments}")
         data = json.loads(mock_segments.read_text())
     else:
         transcript = json.loads((workdir / "transcript.json").read_text())["segments"]
-        prompt = build_segment_prompt(workdir, transcript)
+        prompt = build_segment_prompt(workdir, transcript, day_title=day_title)
         prompt_file = workdir / "segment-prompt.md"
         prompt_file.write_text(prompt)
         log(f"segment: prompt is {len(prompt)} chars -> {prompt_file}")
@@ -518,14 +558,13 @@ def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
             sys.exit(f"ERROR: pi failed (rc={proc.returncode}):\n{proc.stderr[-3000:]}")
         (workdir / "segment-raw-output.txt").write_text(proc.stdout)
         data = extract_json_block(proc.stdout)
-    data = validate_segments(data, probe_duration(workdir / "raw.mp4"))
+    data = validate_segments(data, duration)
     segments_json.write_text(json.dumps(data, indent=2))
-    n_days = len(data["days"])
-    n_seg = sum(len(d["segments"]) for d in data["days"])
-    n_sec = sum(len(s["sections"]) for d in data["days"] for s in d["segments"])
-    n_break = sum(1 for d in data["days"] for s in d["segments"]
-                  for sec in s["sections"] if sec["kind"] == "break")
-    log(f"segment: {n_days} days, {n_seg} segments, {n_sec} sections ({n_break} breaks) -> segments.json")
+    segs = segments_of(data)
+    n_sec = sum(len(s["sections"]) for s in segs)
+    n_break = sum(1 for s in segs for sec in s["sections"] if sec["kind"] == "break")
+    log(f"segment: {len(segs)} segments, {n_sec} sections ({n_break} breaks) -> segments.json"
+        + (f' [day: {day_title}]' if day_title else ""))
     return data
 
 
@@ -540,31 +579,43 @@ def extract_json_block(text: str) -> dict:
     return json.loads(blocks[-1])
 
 
+def segments_of(data: dict) -> list[dict]:
+    """The segment list of the intermediate format; tolerates the legacy
+    {"days": [{... "segments": [...]}]} shape by flattening it."""
+    if "segments" in data:
+        return data["segments"]
+    return [s for d in data.get("days", []) for s in d.get("segments", [])]
+
+
 def validate_segments(data: dict, duration: float) -> dict:
-    """Normalize + sanity-check the intermediate format; clamp to video duration."""
-    if "days" not in data:
-        sys.exit(f"ERROR: segments JSON missing 'days': {list(data)}")
-    for day in data["days"]:
-        day["start"] = max(0.0, min(float(day.get("start", 0)), duration))
-        day["end"] = min(float(day.get("end", duration)), duration)
-        for seg in day.get("segments", []):
-            seg.setdefault("kind", "episode")
-            seg["start"] = max(0.0, min(float(seg.get("start", 0)), duration))
-            seg["end"] = min(float(seg.get("end", duration)), duration)
-            if seg["end"] <= seg["start"]:
-                seg["end"] = min(seg["start"] + 1, duration)
-            sections = []
-            for sec in seg.get("sections", []):
-                sec.setdefault("kind", "content")
-                sec["start"] = max(seg["start"], min(float(sec.get("start", seg["start"])), seg["end"]))
-                sec["end"] = min(seg["end"], max(float(sec.get("end", sec["start"])), sec["start"]))
-                if sec["end"] > sec["start"]:
-                    sections.append(sec)
-            if not sections:
-                sections = [{"kind": "content", "title": seg.get("title", "segment"),
-                             "start": seg["start"], "end": seg["end"]}]
-            seg["sections"] = sections
-    return data
+    """Normalize + sanity-check the intermediate format ({"segments": [...]});
+    clamps to the video duration. Accepts the legacy days>segments shape too."""
+    segs: list[dict] = []
+    for seg in segments_of(data):
+        seg = dict(seg)
+        seg.setdefault("kind", "episode")
+        seg["start"] = max(0.0, min(float(seg.get("start", 0)), duration))
+        seg["end"] = min(float(seg.get("end", duration)), duration)
+        if seg["end"] <= seg["start"]:
+            seg["end"] = min(seg["start"] + 1, duration)
+        sections = []
+        for sec in seg.get("sections", []):
+            sec = dict(sec)
+            sec.setdefault("kind", "content")
+            sec["start"] = max(seg["start"], min(float(sec.get("start", seg["start"])), seg["end"]))
+            sec["end"] = min(seg["end"], max(float(sec.get("end", sec["start"])), sec["start"]))
+            if sec["end"] > sec["start"]:
+                sections.append(sec)
+        if not sections:
+            sections = [{"kind": "content", "title": seg.get("title", "segment"),
+                         "start": seg["start"], "end": seg["end"]}]
+        seg["sections"] = sections
+        segs.append(seg)
+    if not segs:
+        segs = [{"kind": "episode", "title": "video", "start": 0.0, "end": duration,
+                 "sections": [{"kind": "content", "title": "video",
+                               "start": 0.0, "end": duration}]}]
+    return {"segments": segs}
 
 
 # --------------------------------------------------------------------------- #
@@ -582,11 +633,10 @@ def hms(t: float) -> str:
 
 
 def build_editlist_yaml(data: dict, combined: bool, keyframes: list[list[float]] | None = None) -> list[dict]:
-    """Convert segments.json (days>segments>sections) to an ffmpeg-editlist YAML list.
+    """Convert segments.json (segments>sections) to an ffmpeg-editlist YAML list.
 
-    One output per level-2 segment (icebreaker/episode), containing only non-break
-    sections; TOC entries are emitted for every section. Optionally one combined
-    output with all breaks removed.
+    One output per segment (icebreaker/episode), containing only non-break
+    sections. Optionally one combined output with all breaks removed.
 
     If `keyframes` is given, every range start is snapped to the keyframe a
     stream-copied cut would actually start at (see snap_to_keyframe), so the actual
@@ -613,23 +663,19 @@ def build_editlist_yaml(data: dict, combined: bool, keyframes: list[list[float]]
             out = [(seg["start"], seg["end"], seg.get("title", ""))]
         return out
 
-    day_idx = 0
-    for day in data["days"]:
-        day_idx += 1
-        for seg_idx, seg in enumerate(day["segments"], 1):
-            name = f"day{day_idx}-{seg_idx:02d}-{slugify(seg.get('title', seg['kind']))}.mp4"
-            entry = {"output": name, "editlist": []}
-            for (s, e, _title) in ranges_for(seg):
-                entry["editlist"].append({"start": hms_ms(s)})
-                entry["editlist"].append({"stop": hms_ms(e)})
-            doc.append(entry)
+    for seg_idx, seg in enumerate(segments_of(data), 1):
+        name = f"{seg_idx:02d}-{slugify(seg.get('title', seg['kind']))}.mp4"
+        entry = {"output": name, "editlist": []}
+        for (s, e, _title) in ranges_for(seg):
+            entry["editlist"].append({"start": hms_ms(s)})
+            entry["editlist"].append({"stop": hms_ms(e)})
+        doc.append(entry)
 
     if combined:
         entry = {"output": "full-nobreaks.mp4", "editlist": []}
         all_ranges = []
-        for day in data["days"]:
-            for seg in day["segments"]:
-                all_ranges.extend(ranges_for(seg))
+        for seg in segments_of(data):
+            all_ranges.extend(ranges_for(seg))
         all_ranges.sort()
         merged: list[list] = []
         for s, e, _title in all_ranges:
@@ -644,18 +690,19 @@ def build_editlist_yaml(data: dict, combined: bool, keyframes: list[list[float]]
     return doc
 
 
-def write_chapters(data: dict, outdir: Path) -> None:
-    """Human/ffmpeg-readable chapter lists derived from the intermediate format."""
+def write_chapters(data: dict, outdir: Path, day_title: str | None = None) -> None:
+    """Human/ffmpeg-readable chapter list derived from the intermediate format.
+    day_title (config mode) is the day this video belongs to, given by the config."""
     lines = []
-    for day_idx, day in enumerate(data["days"], 1):
-        lines.append(f"# {day.get('title', f'Day {day_idx}')} [{hms(day['start'])}-{hms(day['end'])}]")
-        for seg_idx, seg in enumerate(day["segments"], 1):
-            lines.append(f"  segment {seg_idx} ({seg.get('kind')}): {seg.get('title','')} "
-                         f"[{hms(seg['start'])}-{hms(seg['end'])}]")
-            for sec in seg["sections"]:
-                marker = " (REMOVED)" if sec["kind"] == "break" else ""
-                lines.append(f"    - {sec.get('kind')}: {sec.get('title','')} "
-                             f"[{hms(sec['start'])}-{hms(sec['end'])}]{marker}")
+    if day_title:
+        lines.append(f"# {day_title}")
+    for seg_idx, seg in enumerate(segments_of(data), 1):
+        lines.append(f"segment {seg_idx} ({seg.get('kind')}): {seg.get('title','')} "
+                     f"[{hms(seg['start'])}-{hms(seg['end'])}]")
+        for sec in seg["sections"]:
+            marker = " (REMOVED)" if sec["kind"] == "break" else ""
+            lines.append(f"  - {sec.get('kind')}: {sec.get('title','')} "
+                         f"[{hms(sec['start'])}-{hms(sec['end'])}]{marker}")
     (outdir / "chapters.txt").write_text("\n".join(lines) + "\n")
 
 
@@ -676,7 +723,7 @@ def apply_subs(mp4: Path, srt: Path, out: Path, mode: str) -> None:
 
 
 def step_edit(workdir: Path, data: dict, subs: str, reencode: bool, combined: bool,
-              snap_keyframes: bool = True) -> None:
+              snap_keyframes: bool = True, day_title: str | None = None) -> None:
     workdir = workdir.resolve()
     outdir = (workdir / "out").resolve()
     outdir.mkdir(exist_ok=True)
@@ -705,7 +752,7 @@ def step_edit(workdir: Path, data: dict, subs: str, reencode: bool, combined: bo
     if reencode:
         cmd.append("--reencode")
     run(cmd, cwd=workdir)
-    write_chapters(data, outdir)
+    write_chapters(data, outdir, day_title=day_title)
 
     # Sync report: verify each output's actual video timeline matches the nominal
     # editlist timeline that the sidecar .srt was rebased onto.
@@ -784,87 +831,228 @@ def step_edit(workdir: Path, data: dict, subs: str, reencode: bool, combined: bo
 
 
 # --------------------------------------------------------------------------- #
+# CLI / TOML config
+# --------------------------------------------------------------------------- #
 
-def main() -> None:
+# Built-in defaults for every pipeline option. Resolution order:
+# explicit CLI flag > TOML config value (global, then per-[[days]] override) > default.
+# argparse therefore uses default=None for all of these and they are resolved later.
+BUILTIN_DEFAULTS = {
+    "workdir_root": "work",          # config mode: base dir for per-day workdirs
+    "height": 1080,
+    "language": None,
+    "transcribe_model": DEFAULT_TRANSCRIBE_MODEL,
+    "segment_model": DEFAULT_SEGMENT_MODEL,
+    "effort": DEFAULT_EFFORT,
+    "chunk_minutes": API_MAX_CHUNK_MINUTES,
+    "subs": "embed",
+    "reencode": False,
+    "no_combined": False,
+    "pi_bin": os.environ.get("PI_BIN", "pi"),
+    "skip_download": False,
+    "skip_transcribe": False,
+    "skip_segment": False,
+    "skip_edit": False,
+    "force_edit": False,
+    "no_snap_keyframes": False,
+    "max_retries": 5,
+    "retry_base_seconds": 2.0,
+    "retry_max_seconds": 120.0,
+    "mock_transcript": None,
+    "mock_segments": None,
+}
+
+PATH_KEYS = {"mock_transcript", "mock_segments"}
+DAY_SOURCE_KEYS = {"url", "path", "title", "workdir"}
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("url", help="YouTube URL or 11-char video ID")
+    ap.add_argument("url", nargs="?", default=None,
+                    help="YouTube URL or 11-char video ID (single-video mode; not used with --config)")
+    ap.add_argument("--config", type=Path, default=None,
+                    help="TOML config listing the day videos of an event ([[days]] entries with "
+                         "url= or path=). Each video is treated as exactly one day -- the "
+                         "segment stage does not guess days. See config.example.toml")
     ap.add_argument("--workdir", type=Path, default=None,
-                    help="working/output dir (default: ./work/<video_id>)")
-    ap.add_argument("--height", type=int, default=1080,
+                    help="working/output dir (single-video mode; in config mode: base dir for "
+                         "the per-day workdirs, default: ./work)")
+    ap.add_argument("--height", type=int, default=None,
                     help="max video height for download (0 = best available)")
     ap.add_argument("--language", default=None,
                     help="ISO 639-1 language code for transcription (default: auto-detect)")
-    ap.add_argument("--transcribe-model", default=DEFAULT_TRANSCRIBE_MODEL)
-    ap.add_argument("--segment-model", default=DEFAULT_SEGMENT_MODEL,
+    ap.add_argument("--transcribe-model", default=None)
+    ap.add_argument("--segment-model", default=None,
                     help="pi model for segmentation (Mistral Large line; literal Large 3 id: mistral/mistral-large-2512)")
-    ap.add_argument("--effort", default=DEFAULT_EFFORT,
+    ap.add_argument("--effort", default=None,
                     help="pi thinking/effort level for segmentation")
-    ap.add_argument("--chunk-minutes", type=int, default=API_MAX_CHUNK_MINUTES,
+    ap.add_argument("--chunk-minutes", type=int, default=None,
                     help="audio chunk size for transcription (API max is 60)")
-    ap.add_argument("--subs", choices=["embed", "burn", "sidecar"], default="embed",
+    ap.add_argument("--subs", choices=["embed", "burn", "sidecar"], default=None,
                     help="how to apply subtitles to outputs (default: embed as mov_text)")
-    ap.add_argument("--reencode", action="store_true",
+    ap.add_argument("--reencode", action="store_true", default=None,
                     help="re-encode segments in ffmpeg-editlist (seamless cuts, slower)")
-    ap.add_argument("--no-combined", action="store_true",
+    ap.add_argument("--no-combined", action="store_true", default=None,
                     help="do not emit the combined full-nobreaks.mp4 output")
-    ap.add_argument("--pi-bin", default=os.environ.get("PI_BIN", "pi"))
-    ap.add_argument("--skip-download", action="store_true")
-    ap.add_argument("--skip-transcribe", action="store_true")
-    ap.add_argument("--skip-segment", action="store_true")
-    ap.add_argument("--skip-edit", action="store_true",
+    ap.add_argument("--pi-bin", default=None)
+    ap.add_argument("--skip-download", action="store_true", default=None)
+    ap.add_argument("--skip-transcribe", action="store_true", default=None)
+    ap.add_argument("--skip-segment", action="store_true", default=None)
+    ap.add_argument("--skip-edit", action="store_true", default=None,
                     help="skip the edit stage even if not done yet")
-    ap.add_argument("--force-edit", action="store_true",
+    ap.add_argument("--force-edit", action="store_true", default=None,
                     help="redo the edit stage even if the .edit-done marker exists")
-    ap.add_argument("--no-snap-keyframes", action="store_true",
+    ap.add_argument("--no-snap-keyframes", action="store_true", default=None,
                     help="do not snap editlist cut points to video keyframes (stream-copied cuts "
                          "then start at the next keyframe and subtitles drift; the sync report "
                          "in out/sync-report.txt is still written)")
-    ap.add_argument("--max-retries", type=int, default=5,
+    ap.add_argument("--max-retries", type=int, default=None,
                     help="per-chunk transcription retry limit (5xx/429/network errors)")
-    ap.add_argument("--retry-base-seconds", type=float, default=2.0,
+    ap.add_argument("--retry-base-seconds", type=float, default=None,
                     help="exponential backoff base for transcription retries")
-    ap.add_argument("--retry-max-seconds", type=float, default=120.0,
+    ap.add_argument("--retry-max-seconds", type=float, default=None,
                     help="cap for the backoff delay between retries")
     ap.add_argument("--mock-transcript", type=Path, default=None,
                     help="testing: JSON file with {'segments': [...]} instead of API call")
     ap.add_argument("--mock-segments", type=Path, default=None,
                     help="testing: JSON file with the intermediate segments format")
-    args = ap.parse_args()
+    return ap.parse_args(argv)
 
-    vid = video_id_from_url(args.url)
-    workdir = args.workdir or Path("work") / vid
+
+def _norm_keys(table: dict, where: str) -> dict:
+    out = {}
+    for k, v in table.items():
+        key = k.replace("-", "_")
+        if key not in BUILTIN_DEFAULTS:
+            sys.exit(f"ERROR: unknown option {k!r} in {where} "
+                     f"(allowed: {', '.join(sorted(BUILTIN_DEFAULTS))})")
+        if key in PATH_KEYS and v is not None:
+            v = Path(v)
+        if key == "subs" and v not in ("embed", "burn", "sidecar"):
+            sys.exit(f"ERROR: subs must be embed|burn|sidecar, got {v!r} in {where}")
+        out[key] = v
+    return out
+
+
+def load_config(path: Path) -> tuple[dict, list[dict]]:
+    """Parse the TOML config: top-level keys are global pipeline options, [[days]]
+    entries are the day videos. Returns (global_options, day_entries)."""
+    import tomllib
+    try:
+        raw = tomllib.loads(path.read_text())
+    except tomllib.TOMLDecodeError as e:
+        sys.exit(f"ERROR: invalid TOML in {path}: {e}")
+    raw = dict(raw)
+    days = raw.pop("days", None)
+    if not days:
+        sys.exit(f"ERROR: {path} has no [[days]] entries (each entry is one day video)")
+    globals_ = _norm_keys(raw, str(path))
+    entries: list[dict] = []
+    for i, d in enumerate(days, 1):
+        if not isinstance(d, dict):
+            sys.exit(f"ERROR: [[days]] entry {i} in {path} is not a table")
+        where = f"{path} [[days]] entry {i}"
+        d = {k.replace("-", "_"): v for k, v in d.items()}
+        url, p = d.get("url"), d.get("path")
+        if bool(url) == bool(p):
+            sys.exit(f"ERROR: {where} must have exactly one of 'url' (YouTube) or 'path' (local file)")
+        unknown = set(d) - DAY_SOURCE_KEYS - set(BUILTIN_DEFAULTS)
+        if unknown:
+            sys.exit(f"ERROR: unknown keys {sorted(unknown)} in {where}")
+        overrides = _norm_keys({k: v for k, v in d.items() if k not in DAY_SOURCE_KEYS}, where)
+        entries.append({
+            "url": url,
+            "path": Path(p) if p else None,
+            "title": d.get("title"),
+            "workdir": Path(d["workdir"]) if d.get("workdir") else None,
+            "overrides": overrides,
+        })
+    return globals_, entries
+
+
+def resolve_options(cli: argparse.Namespace, toml_globals: dict,
+                    overrides: dict | None = None) -> dict:
+    """CLI flag (if given) > per-day TOML override > global TOML value > built-in default."""
+    opt = {}
+    for key, default in BUILTIN_DEFAULTS.items():
+        v = getattr(cli, key, None)
+        if v is None and overrides is not None:
+            v = overrides.get(key)
+        if v is None:
+            v = toml_globals.get(key)
+        if v is None:
+            v = default
+        opt[key] = v
+    return opt
+
+
+def run_pipeline(opt: dict, source: dict, day_title: str | None) -> None:
+    """Run all stages for one input video. day_title is set in config mode, where the
+    video is one pre-cut day and the segment stage must not guess days."""
+    url, path = source.get("url"), source.get("path")
+    if source.get("workdir"):
+        workdir = Path(source["workdir"])
+    elif day_title:
+        workdir = Path(opt["workdir_root"]) / slugify(day_title)
+    elif url:
+        workdir = Path(opt["workdir_root"]) / video_id_from_url(url)
+    else:
+        workdir = Path(opt["workdir_root"]) / slugify(path.stem)
     workdir.mkdir(parents=True, exist_ok=True)
-    log(f"workdir: {workdir.resolve()}")
+    log(f"workdir: {workdir.resolve()}" + (f" (day: {day_title})" if day_title else ""))
 
-    if not args.skip_download:
-        step_download(args.url, workdir, args.height or None)
+    if not opt["skip_download"]:
+        if url:
+            step_download(url, workdir, opt["height"] or None)
+        else:
+            step_download_local(path, workdir, title=day_title)
     else:
         log("download: skipped")
 
-    if not args.skip_transcribe:
-        step_transcribe(workdir, args.transcribe_model, args.language,
-                        args.chunk_minutes, args.mock_transcript,
-                        max_retries=args.max_retries, retry_base=args.retry_base_seconds,
-                        retry_max=args.retry_max_seconds)
+    if not opt["skip_transcribe"]:
+        step_transcribe(workdir, opt["transcribe_model"], opt["language"],
+                        opt["chunk_minutes"], opt["mock_transcript"],
+                        max_retries=opt["max_retries"], retry_base=opt["retry_base_seconds"],
+                        retry_max=opt["retry_max_seconds"])
     else:
         log("transcribe: skipped")
 
-    if not args.skip_segment:
-        data = step_segment(workdir, args.segment_model, args.effort,
-                            args.pi_bin, args.mock_segments)
+    if not opt["skip_segment"]:
+        data = step_segment(workdir, opt["segment_model"], opt["effort"],
+                            opt["pi_bin"], opt["mock_segments"], day_title=day_title)
     else:
         log("segment: skipped")
         data = json.loads((workdir / "segments.json").read_text())
 
-    if args.skip_edit:
+    if opt["skip_edit"]:
         log("edit: skipped (--skip-edit)")
-    elif (workdir / ".edit-done").exists() and not args.force_edit:
+    elif (workdir / ".edit-done").exists() and not opt["force_edit"]:
         log("edit: .edit-done marker exists, skipping (use --force-edit to redo)")
     else:
-        step_edit(workdir, data, args.subs, args.reencode, combined=not args.no_combined,
-                  snap_keyframes=not args.no_snap_keyframes)
+        step_edit(workdir, data, opt["subs"], opt["reencode"], combined=not opt["no_combined"],
+                  snap_keyframes=not opt["no_snap_keyframes"], day_title=day_title)
     log(f"DONE. Outputs in {(workdir / 'out').resolve()}")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.config:
+        if args.url:
+            sys.exit("ERROR: pass either a YouTube URL or --config, not both")
+        toml_globals, days = load_config(args.config)
+        if args.workdir is not None:  # in config mode --workdir is the workdir root
+            toml_globals = {**toml_globals, "workdir_root": str(args.workdir)}
+        for i, day in enumerate(days, 1):
+            opt = resolve_options(args, toml_globals, day["overrides"])
+            title = day["title"] or f"Day {i}"
+            log(f"=== day {i}/{len(days)}: {title} ({day['url'] or day['path']}) ===")
+            run_pipeline(opt, day, day_title=title)
+    else:
+        if not args.url:
+            sys.exit("ERROR: a YouTube URL/video ID is required without --config (see --help)")
+        opt = resolve_options(args, {})
+        run_pipeline(opt, {"url": args.url, "workdir": args.workdir}, day_title=None)
 
 
 if __name__ == "__main__":

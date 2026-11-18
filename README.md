@@ -12,8 +12,10 @@
    plus `--effort medium` when the pi build supports it; the literal Mistral-Large-3 id
    `mistral/mistral-large-2512` can be pinned with `--segment-model`) asking the
    Mistral-Large model to
-   segment hierarchically into **days → segments (icebreaker/episode) → sections
-   (content/exercise/break)** → intermediate format `segments.json`.
+   segment hierarchically into **segments (icebreaker/episode) → sections
+   (content/exercise/break)** → intermediate format `segments.json`. Days are never
+   guessed: with `--config` each video is one day named by its `[[days]]` entry;
+   a single-video run gets no day level at all.
    The prompt tells the model to first anchor every boundary to a transcript
    timestamp, then optionally fine-tune it visually: `ffprobe` keyframe listing +
    `ffmpeg` frame extraction, ImageMagick `compare -metric` between frames, and
@@ -37,7 +39,7 @@
 ## Outputs (in `work/<video_id>/out/`)
 
 - `original-with-subs.mp4` – the original mp4 with subtitles applied
-- `day<N>-<NN>-<segment>.mp4` – one file per level-2 segment (icebreaker/episode),
+- `<NN>-<segment>.mp4` – one file per segment (icebreaker/episode),
   **break sections removed**, subtitles applied (`subs-` prefix when embedded)
 - `full-nobreaks.mp4` – the whole video with all breaks removed (disable with `--no-combined`)
 - `chapters.txt`, `sync-report.txt` (per-output subtitle/video drift measured after
@@ -52,6 +54,38 @@ export MISTRAL_API_KEY=...
 uv run --script pipeline.py "https://www.youtube.com/watch?v=VIDEO_ID" \
     --workdir work/VIDEO_ID
 ```
+
+## Multi-day events via a TOML config
+
+Instead of one video, pass `--config event.toml` listing the **day videos** of an
+event (see `config.example.toml`):
+
+```toml
+workdir_root = "work"
+language = "en"
+subs = "embed"
+
+[[days]]
+url = "https://www.youtube.com/watch?v=DAY1_VIDEO_ID"
+title = "Day 1"
+
+[[days]]
+path = "/data/event/day2.mp4"     # local file works too
+title = "Day 2"
+```
+
+```sh
+uv run --script pipeline.py --config event.toml
+```
+
+Each `[[days]]` entry must have exactly one of `url=` (YouTube) or `path=` (local
+file), plus an optional `title=` that names the day. Every video is processed in
+its own workdir (`workdir_root/<slug(title)>`, or `workdir=` if given) and treated
+as exactly that one day — the segment stage never guesses days; the day only
+appears as context in the prompt and as a header in `chapters.txt`. Top-level TOML
+keys set global options, `[[days]]` entries may override them per day, and
+explicit CLI flags win over both (resolution: CLI > per-day TOML > global TOML >
+built-in default).
 
 Requirements on PATH: `uv`, `ffmpeg`, `ffprobe`, ImageMagick (`compare`, used when the
 segment model fine-tunes cut points visually), `pi`, `node` (yt-dlp JS runtime).

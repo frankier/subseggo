@@ -1,0 +1,35 @@
+# subseggo config: process a multi-day event given as a list of day videos.
+#
+# Run:  uv run --script pipeline.py --config event.toml [options]
+#
+# Each [[days]] entry is ONE day of the event (the video is already cut to that
+# day). Days are never guessed: the day comes from the entry itself (title=),
+# and every video is processed in its own workdir under workdir_root.
+#
+# Any pipeline option can be set globally at the top level of this file and/or
+# per [[days]] entry (per-day keys win over global ones). Explicit CLI flags
+# win over both. Keys use the CLI flag names with underscores, e.g.:
+#   height, language, transcribe_model, segment_model, effort, chunk_minutes,
+#   subs ("embed"|"burn"|"sidecar"), reencode, no_combined, pi_bin,
+#   skip_download, skip_transcribe, skip_segment, skip_edit, force_edit,
+#   no_snap_keyframes, max_retries, retry_base_seconds, retry_max_seconds,
+#   mock_transcript, mock_segments, workdir_root
+
+workdir_root = "work"   # per-day workdirs are created under this dir
+height = 1080
+language = "en"
+subs = "embed"
+
+[[days]]
+url = "https://www.youtube.com/watch?v=DAY1_VIDEO_ID"   # YouTube URL or 11-char ID
+title = "Day 1"                                          # names the day (prompt context + chapters)
+# workdir = "work/day-1"                                 # optional; default work/<slug(title)> or work/<video_id>
+
+[[days]]
+path = "/data/event/day2.mp4"                           # local file instead of a YouTube URL
+title = "Day 2"
+
+[[days]]
+url = "https://www.youtube.com/watch?v=DAY3_VIDEO_ID"
+title = "Day 3"
+subs = "sidecar"                                         # per-day override of a global option
