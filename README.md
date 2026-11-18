@@ -13,7 +13,15 @@
    `mistral/mistral-large-2512` can be pinned with `--segment-model`) asking the
    Mistral-Large model to
    segment hierarchically into **days → segments (icebreaker/episode) → sections
-   (content/exercise/break)** → intermediate format `segments.json`
+   (content/exercise/break)** → intermediate format `segments.json`.
+   The prompt tells the model to first anchor every boundary to a transcript
+   timestamp, then optionally fine-tune it visually: `ffprobe` keyframe listing +
+   `ffmpeg` frame extraction, ImageMagick `compare -metric` between frames, and
+   viewing the extracted frames directly (the model is multimodal). Cut points
+   should land on video keyframes — seek **backwards** to the previous keyframe at
+   the beginning of a segment (a mid-GOP start would make the stream-copied cut
+   begin at the *next* keyframe, dropping the segment start), and **forwards** to
+   the next keyframe at the end of one so the tail is not cut off mid-GOP.
 4. **edit** – converts `segments.json` to an `editlist.yaml` for
    [`ffmpeg-editlist`](https://pypi.org/project/ffmpeg-editlist/) and runs it with
    `--srt --no-mkv-props`, then muxes the cut `.srt` into each `.mp4` as `mov_text`.
@@ -45,7 +53,8 @@ uv run --script pipeline.py "https://www.youtube.com/watch?v=VIDEO_ID" \
     --workdir work/VIDEO_ID
 ```
 
-Requirements on PATH: `uv`, `ffmpeg`, `ffprobe`, `pi`, `node` (yt-dlp JS runtime).
+Requirements on PATH: `uv`, `ffmpeg`, `ffprobe`, ImageMagick (`compare`, used when the
+segment model fine-tunes cut points visually), `pi`, `node` (yt-dlp JS runtime).
 Options: `--language en`, `--subs embed|burn|sidecar`, `--reencode`,
 `--transcribe-model`, `--segment-model`, `--effort`, `--chunk-minutes`,
 `--skip-download/--skip-transcribe/--skip-segment/--skip-edit`, `--force-edit`,
@@ -85,9 +94,9 @@ With rootless podman on an SELinux system the bind mount needs a relabel
 The pipeline was tested end-to-end in this image (download → Voxtral
 transcription → pi segmentation → editlist → mp4 + mov_text outputs).
 
-The image is `debian:bookworm-slim` + ffmpeg + Node 22 (official tarball; pi needs
-≥ 22.19, yt-dlp uses it as JS runtime) + `uv` + `pi` (`npm i -g
-@earendil-works/pi-coding-agent@1.5.2`). Entrypoint is
+The image is `debian:bookworm-slim` + ffmpeg + ImageMagick + Node 22 (official
+tarball; pi needs ≥ 22.19, yt-dlp uses it as JS runtime) + `uv` + `pi`
+(`npm i -g @earendil-works/pi-coding-agent@1.5.2`). Entrypoint is
 `uv run --script /app/pipeline.py`, so all script args pass straight through.
 
 ## Intermediate format (`segments.json`)

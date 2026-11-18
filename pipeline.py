@@ -37,7 +37,8 @@ edit stages are all cached/skipped automatically):
 Usage:
   uv run --script pipeline.py "https://www.youtube.com/watch?v=VIDEO_ID" [options]
 
-Requires on PATH: ffmpeg, ffprobe, pi (and node as yt-dlp JS runtime, optional).
+Requires on PATH: ffmpeg, ffprobe, pi, imagemagick (compare; lets the segment model
+fine-tune cut points visually) (and node as yt-dlp JS runtime, optional).
 Requires env: MISTRAL_API_KEY (for the transcription API; `pi` uses its own auth).
 """
 
@@ -371,9 +372,10 @@ def step_transcribe(workdir: Path, model: str, language: str | None,
 # --------------------------------------------------------------------------- #
 
 SEGMENT_PROMPT = """\
-You are segmenting a recorded workshop/training video into a hierarchy using ONLY the
-transcript below. The transcript lines are prefixed with the timestamp in the ORIGINAL
-video, format [hh:mm:ss].
+You are segmenting a recorded workshop/training video into a hierarchy. Find the
+initial cut points from the transcript below, then fine-tune them visually (see
+VISUAL FINE-TUNING and KEYFRAME CUTS at the end). The transcript lines are prefixed
+with the timestamp in the ORIGINAL video, format [hh:mm:ss].
 
 VIDEO METADATA:
 Title: {title}
@@ -400,10 +402,39 @@ RULES:
 - All times are in SECONDS in the original video (numbers, not strings).
 - days/segments/sections must be contiguous and non-overlapping; sections must exactly
   partition their parent segment (section.start == previous section.end).
-- Anchor every boundary to a transcript timestamp (use the timestamp of the line where
-  the topic changes). Round to whole seconds.
+- Anchor every boundary first to a transcript timestamp (use the timestamp of the
+  line where the topic changes). Round to whole seconds. After visual fine-tuning,
+  boundary times should sit on video keyframes where possible (see KEYFRAME CUTS).
 - Keep titles short and descriptive.
 - Do NOT invent content that is not in the transcript.
+
+VISUAL FINE-TUNING (optional, but recommended for precise boundaries):
+The original video is available as raw.mp4 in the directory containing this prompt
+file, and ffmpeg/ffprobe and ImageMagick are installed on PATH. After picking a cut
+point from the transcript, refine it using the visuals:
+- List the video keyframes (packets whose flags contain K) with their timestamps:
+    ffprobe -v error -select_streams v:0 -show_entries packet=pts_time,dts_time,flags -of csv=p=0 raw.mp4
+  (if a previous edit run left keyframes.json in this directory, read the keyframe
+  list from there instead of probing again)
+- Extract the frame at time t as a PNG:
+    ffmpeg -y -ss <t> -i raw.mp4 -frames:v 1 frame.png
+- Measure the visual difference between two frames with ImageMagick:
+    compare -metric AE frame_a.png frame_b.png null:
+  (also try -metric RMSE; a large value means the picture changed -- a scene/slide/
+  camera cut; `compare` can also write a highlighted diff image instead of null:)
+- You are a multimodal model: read the extracted PNGs and look at them directly to
+  see where the picture actually changes (slide transitions, camera cuts,
+  screen-share start/stop, black or break frames).
+
+KEYFRAME CUTS:
+The edit stage cuts with stream copy, so every cut point must be a video keyframe
+(use the ffprobe keyframe listing above). When fine-tuning a boundary, snap it to a
+keyframe:
+- At the BEGINNING of a segment, seek BACKWARDS to the previous keyframe: a start
+  time inside a GOP makes the stream-copied cut begin at the NEXT keyframe instead,
+  which drops the beginning of the segment.
+- At the END of a segment, seeking FORWARD to the next keyframe may be needed so the
+  tail of the segment is not cut off mid-GOP.
 
 OUTPUT FORMAT: reply with exactly one fenced ```json code block and nothing else,
 conforming to this schema:
