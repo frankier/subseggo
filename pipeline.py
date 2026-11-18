@@ -25,6 +25,14 @@ edit stages are all cached/skipped automatically):
   4. edit        : segments.json -> editlist.yaml -> ffmpeg-editlist (--srt)
                    -> per-segment mp4 outputs with break sections removed,
                       plus the original mp4 with subtitles applied.
+                   Cut points are snapped to video keyframes (raw.mp4 is probed once,
+                   cached in workdir/keyframes.json) so the stream-copied cuts start
+                   exactly where the editlist says -- otherwise each range's video
+                   begins at the next keyframe and the (nominal-time) subtitles drift
+                   against it, accumulating a visible offset at every cut. A sync
+                   report (out/sync-report.txt) verifies per output that the actual
+                   video range starts match the nominal editlist times (--no-snap-keyframes
+                   disables the snapping).
 
 Usage:
   uv run --script pipeline.py "https://www.youtube.com/watch?v=VIDEO_ID" [options]
@@ -130,6 +138,106 @@ def probe_duration(path: Path) -> float:
          "-of", "default=nw=1:nk=1", str(path)],
         check=True, capture_output=True, text=True).stdout.strip()
     return float(out)
+
+
+def probe_keyframes(mp4: Path) -> list[list[float]]:
+    """Video keyframes of an mp4 as [pts, dts] pairs (seconds), sorted by pts."""
+    out = subprocess.run(
+        [which_or_die("ffprobe"), "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "packet=pts_time,dts_time,flags", "-of", "csv=p=0", str(mp4)],
+        check=True, capture_output=True, text=True).stdout
+    kfs = []
+    for line in out.splitlines():
+        parts = line.split(",")
+        if len(parts) == 3 and "K" in parts[2]:
+            kfs.append([float(parts[0]), float(parts[1])])
+    return sorted(kfs)
+
+
+def snap_to_keyframe(t: float, kfs: list[list[float]]) -> float:
+    """Editlist start value that makes a stream-copy cut begin exactly at a keyframe.
+
+    ffmpeg `-ss` (output option) with `-c copy` drops packets while dts < ss, so a cut
+    at `t` actually starts at the first keyframe with dts >= t.  Returning that
+    keyframe's dts as the new start keeps the keyframe (dts >= ss) and shrinks the
+    leading hole to pts-dts (sub-frame); the sidecar .srt is rebased by the same
+    value, so subtitles stay aligned with the video timeline."""
+    for _pts, dts in kfs:
+        if dts >= t - 1e-3:
+            return max(0.0, dts - 0.001)
+    return t
+
+
+def hms_ms(t: float) -> str:
+    """HH:MM:SS.mmm (ffmpeg-editlist's seconds() and ffmpeg -ss both accept this)."""
+    t = max(0.0, float(t))
+    h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+
+def hms_to_sec(s: str) -> float:
+    h, m, rest = s.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(rest)
+
+
+def probe_output_timeline(mp4: Path) -> tuple[dict[str, float], float]:
+    """Per-codec start_time of an output mp4 + video stream duration."""
+    out = subprocess.run(
+        [which_or_die("ffprobe"), "-v", "error",
+         "-show_entries", "stream=codec_type,start_time,duration",
+         "-of", "default=nw=1", str(mp4)],
+        check=True, capture_output=True, text=True).stdout
+    starts: dict[str, float] = {}
+    video_dur = 0.0
+    codec: str | None = None
+    for line in out.splitlines():
+        if line.startswith("codec_type="):
+            codec = line.split("=", 1)[1]
+        elif line.startswith("start_time=") and codec is not None:
+            starts[codec] = float(line.split("=", 1)[1])
+        elif line.startswith("duration=") and codec == "video":
+            video_dur = max(video_dur, float(line.split("=", 1)[1]))
+    return starts, video_dur
+
+
+def probe_video_range_starts(mp4: Path, nominal_cums: list[float], gap: float = 0.25) -> list[float]:
+    """Actual start pts of each edit range in the output video timeline: the first
+    video pts plus every pts jump > `gap` (a stream-copied cut leaves a hole where the
+    next range starts at a later keyframe).  Matched positionally to the nominal
+    cumulative range starts `nominal_cums`."""
+    out = subprocess.run(
+        [which_or_die("ffprobe"), "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(mp4)],
+        check=True, capture_output=True, text=True).stdout
+    pts = sorted({float(x) for x in out.split() if x.strip()})
+    if not pts:
+        return list(nominal_cums)
+    cands = [pts[0]]
+    for prev, cur in zip(pts, pts[1:]):
+        if cur - prev > gap:
+            cands.append(cur)
+    if len(cands) == len(nominal_cums):
+        return cands
+    # fallback: walk both lists in order; a nominal start with no detected jump
+    # nearby (sub-threshold hole) maps to itself
+    starts = []
+    p = 0
+    for c in nominal_cums:
+        while p < len(cands) and cands[p] < c - 0.5:
+            p += 1
+        if p < len(cands) and cands[p] <= c + 30:
+            starts.append(cands[p])
+        else:
+            starts.append(c)
+    return starts
+
+
+def srt_first_cue(path: Path) -> float | None:
+    m = re.search(r"(\d+):(\d{2}):(\d{2})[,.](\d{1,3})", path.read_text())
+    if not m:
+        return None
+    h, mi, s, ms = m.groups()
+    return int(h) * 3600 + int(mi) * 60 + int(s) + int(ms.ljust(3, "0")[:3]) / 1000.0
 
 
 # --------------------------------------------------------------------------- #
@@ -442,12 +550,17 @@ def hms(t: float) -> str:
     return fmt_hms(float(t))
 
 
-def build_editlist_yaml(data: dict, combined: bool) -> list[dict]:
+def build_editlist_yaml(data: dict, combined: bool, keyframes: list[list[float]] | None = None) -> list[dict]:
     """Convert segments.json (days>segments>sections) to an ffmpeg-editlist YAML list.
 
     One output per level-2 segment (icebreaker/episode), containing only non-break
     sections; TOC entries are emitted for every section. Optionally one combined
     output with all breaks removed.
+
+    If `keyframes` is given, every range start is snapped to the keyframe a
+    stream-copied cut would actually start at (see snap_to_keyframe), so the actual
+    video timeline matches the nominal timeline the sidecar .srt is rebased onto.
+    Times are emitted with millisecond precision (hms_ms).
     """
     # NOTE: ffmpeg-editlist calls mkvpropedit whenever an entry has title/description
     # or TOC entries, and mkvpropedit cannot edit .mp4 files. Since our outputs are
@@ -459,7 +572,12 @@ def build_editlist_yaml(data: dict, combined: bool) -> list[dict]:
         for sec in seg["sections"]:
             if sec["kind"] == "break":
                 continue
-            out.append((sec["start"], sec["end"], sec.get("title", "")))
+            s, e = float(sec["start"]), float(sec["end"])
+            if keyframes:
+                snapped = snap_to_keyframe(s, keyframes)
+                if snapped < e:  # keep degenerate tiny sections unsnapped
+                    s = snapped
+            out.append((s, e, sec.get("title", "")))
         if not out:
             out = [(seg["start"], seg["end"], seg.get("title", ""))]
         return out
@@ -471,8 +589,8 @@ def build_editlist_yaml(data: dict, combined: bool) -> list[dict]:
             name = f"day{day_idx}-{seg_idx:02d}-{slugify(seg.get('title', seg['kind']))}.mp4"
             entry = {"output": name, "editlist": []}
             for (s, e, _title) in ranges_for(seg):
-                entry["editlist"].append({"start": hms(s)})
-                entry["editlist"].append({"stop": hms(e)})
+                entry["editlist"].append({"start": hms_ms(s)})
+                entry["editlist"].append({"stop": hms_ms(e)})
             doc.append(entry)
 
     if combined:
@@ -489,8 +607,8 @@ def build_editlist_yaml(data: dict, combined: bool) -> list[dict]:
             else:
                 merged.append([s, e])
         for s, e in merged:
-            entry["editlist"].append({"start": hms(s)})
-            entry["editlist"].append({"stop": hms(e)})
+            entry["editlist"].append({"start": hms_ms(s)})
+            entry["editlist"].append({"stop": hms_ms(e)})
         doc.append(entry)
     return doc
 
@@ -526,14 +644,29 @@ def apply_subs(mp4: Path, srt: Path, out: Path, mode: str) -> None:
              "-c:a", "copy", str(out)])
 
 
-def step_edit(workdir: Path, data: dict, subs: str, reencode: bool, combined: bool) -> None:
+def step_edit(workdir: Path, data: dict, subs: str, reencode: bool, combined: bool,
+              snap_keyframes: bool = True) -> None:
     workdir = workdir.resolve()
     outdir = (workdir / "out").resolve()
     outdir.mkdir(exist_ok=True)
-    doc = build_editlist_yaml(data, combined=combined)
+    kfs: list[list[float]] | None = None
+    if snap_keyframes:
+        kf_cache = workdir / "keyframes.json"
+        if kf_cache.exists():
+            raw_kfs = json.loads(kf_cache.read_text())["keyframes"]
+            # tolerate an older cache that stored bare pts values instead of [pts, dts]
+            kfs = [kf if isinstance(kf, list) else [kf, kf] for kf in raw_kfs]
+            log(f"edit: loaded {len(kfs)} keyframes from {kf_cache.name}")
+        else:
+            log("edit: probing video keyframes of raw.mp4 (cached in keyframes.json)")
+            kfs = probe_keyframes(workdir / "raw.mp4")
+            kf_cache.write_text(json.dumps({"keyframes": kfs}))
+            log(f"edit: {len(kfs)} keyframes found")
+    doc = build_editlist_yaml(data, combined=combined, keyframes=kfs)
     editlist_yaml = workdir / "editlist.yaml"
     editlist_yaml.write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True))
-    log(f"edit: wrote {editlist_yaml} ({len(doc)-1} outputs)")
+    log(f"edit: wrote {editlist_yaml} ({len(doc)-1} outputs"
+        + (", cut points snapped to keyframes)" if kfs else ")"))
 
     fel = [sys.executable, "-m", "ffmpeg_editlist"]
     cmd = fel + [str(editlist_yaml), str(workdir), "-o", str(outdir),
@@ -542,6 +675,45 @@ def step_edit(workdir: Path, data: dict, subs: str, reencode: bool, combined: bo
         cmd.append("--reencode")
     run(cmd, cwd=workdir)
     write_chapters(data, outdir)
+
+    # Sync report: verify each output's actual video timeline matches the nominal
+    # editlist timeline that the sidecar .srt was rebased onto.
+    report = [f"# sync report {time.strftime('%Y-%m-%dT%H:%M:%S')}",
+              "# drift = actual video range start - nominal (cumulative) editlist start"]
+    for entry in doc[1:]:
+        mp4 = outdir / entry["output"]
+        if not mp4.exists():
+            log(f"edit: WARNING output missing: {mp4}")
+            continue
+        el = entry["editlist"]
+        ranges = [(hms_to_sec(el[i]["start"]), hms_to_sec(el[i + 1]["stop"]))
+                  for i in range(0, len(el) - 1, 2)]
+        cums: list[float] = []
+        c = 0.0
+        for s, e in ranges:
+            cums.append(c)
+            c += e - s
+        actual = probe_video_range_starts(mp4, cums)
+        shifts = [a - cum for a, cum in zip(actual, cums)]
+        starts, _video_dur = probe_output_timeline(mp4)
+        srt = mp4.with_suffix(".srt")
+        first_cue = srt_first_cue(srt) if srt.exists() else float("nan")
+        max_drift = max((abs(s) for s in shifts), default=0.0)
+        report.append(
+            f"{entry['output']}: video_start={starts.get('video', 0.0):.3f} "
+            f"audio_start={starts.get('audio', 0.0):.3f} srt_first={first_cue:.3f} "
+            f"ranges={len(ranges)} max_drift={max_drift * 1000:.0f}ms")
+        for i, (cum, act) in enumerate(zip(cums, actual)):
+            report.append(f"  range {i + 1}: nominal {cum:.3f} -> actual {act:.3f} "
+                          f"(drift {shifts[i] * 1000:+.0f} ms)")
+        if max_drift > 0.5:
+            log(f"edit: WARNING sync drift {max_drift * 1000:.0f} ms in {mp4.name} "
+                f"(see {outdir / 'sync-report.txt'})")
+        else:
+            log(f"edit: sync ok {mp4.name}: max drift {max_drift * 1000:.0f} ms "
+                f"over {len(ranges)} range(s)")
+    (outdir / "sync-report.txt").write_text("\n".join(report) + "\n")
+    log(f"edit: sync report -> {outdir / 'sync-report.txt'}")
 
     # ffmpeg-editlist leaves .srt sidecars (we passed --no-mkv-props because the
     # outputs are .mp4); mux them into the mp4s now.
@@ -613,6 +785,10 @@ def main() -> None:
                     help="skip the edit stage even if not done yet")
     ap.add_argument("--force-edit", action="store_true",
                     help="redo the edit stage even if the .edit-done marker exists")
+    ap.add_argument("--no-snap-keyframes", action="store_true",
+                    help="do not snap editlist cut points to video keyframes (stream-copied cuts "
+                         "then start at the next keyframe and subtitles drift; the sync report "
+                         "in out/sync-report.txt is still written)")
     ap.add_argument("--max-retries", type=int, default=5,
                     help="per-chunk transcription retry limit (5xx/429/network errors)")
     ap.add_argument("--retry-base-seconds", type=float, default=2.0,
@@ -655,7 +831,8 @@ def main() -> None:
     elif (workdir / ".edit-done").exists() and not args.force_edit:
         log("edit: .edit-done marker exists, skipping (use --force-edit to redo)")
     else:
-        step_edit(workdir, data, args.subs, args.reencode, combined=not args.no_combined)
+        step_edit(workdir, data, args.subs, args.reencode, combined=not args.no_combined,
+                  snap_keyframes=not args.no_snap_keyframes)
     log(f"DONE. Outputs in {(workdir / 'out').resolve()}")
 
 

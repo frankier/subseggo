@@ -17,6 +17,14 @@
 4. **edit** – converts `segments.json` to an `editlist.yaml` for
    [`ffmpeg-editlist`](https://pypi.org/project/ffmpeg-editlist/) and runs it with
    `--srt --no-mkv-props`, then muxes the cut `.srt` into each `.mp4` as `mov_text`.
+   Because the cuts are stream-copied, each cut actually starts at the first video
+   keyframe with `dts >= start` (probed once from `raw.mp4`, cached in
+   `workdir/keyframes.json`), so editlist start times are snapped to those keyframes
+   first — otherwise the video timeline gets a hole at every cut point and the
+   nominal-time subtitles drift against it (up to a GOP per cut, accumulating in
+   multi-range outputs). After cutting, a sync report (`out/sync-report.txt`)
+   verifies per output that actual video range starts match the nominal editlist
+   times. Disable snapping with `--no-snap-keyframes`.
 
 ## Outputs (in `work/<video_id>/out/`)
 
@@ -24,8 +32,10 @@
 - `day<N>-<NN>-<segment>.mp4` – one file per level-2 segment (icebreaker/episode),
   **break sections removed**, subtitles applied (`subs-` prefix when embedded)
 - `full-nobreaks.mp4` – the whole video with all breaks removed (disable with `--no-combined`)
-- `chapters.txt`, plus intermediates in the workdir: `transcript.json`, `raw.srt`,
-  `segments.json`, `editlist.yaml`, `segment-prompt.md`, `segment-raw-output.txt`
+- `chapters.txt`, `sync-report.txt` (per-output subtitle/video drift measured after
+  cutting), plus intermediates in the workdir: `transcript.json`, `raw.srt`,
+  `segments.json`, `editlist.yaml`, `keyframes.json`, `segment-prompt.md`,
+  `segment-raw-output.txt`
 
 ## Run locally
 
@@ -39,7 +49,8 @@ Requirements on PATH: `uv`, `ffmpeg`, `ffprobe`, `pi`, `node` (yt-dlp JS runtime
 Options: `--language en`, `--subs embed|burn|sidecar`, `--reencode`,
 `--transcribe-model`, `--segment-model`, `--effort`, `--chunk-minutes`,
 `--skip-download/--skip-transcribe/--skip-segment/--skip-edit`, `--force-edit`,
-`--mock-transcript`, `--mock-segments` (offline testing). See `--help`.
+`--no-snap-keyframes`, `--mock-transcript`, `--mock-segments` (offline testing).
+See `--help`.
 
 ## Retries and resuming a partial run
 
@@ -102,4 +113,5 @@ The image is `debian:bookworm-slim` + ffmpeg + Node 22 (official tarball; pi nee
 All times are seconds in the original video; sections partition their segment.
 `build_editlist_yaml()` converts this to ffmpeg-editlist YAML: one output per
 segment, editlist = the non-`break` section ranges (start/stop pairs in
-`HH:MM:SS`), plus an optional combined output.
+`HH:MM:SS.mmm`, start times snapped to keyframes when available), plus an optional
+combined output.
