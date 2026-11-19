@@ -220,6 +220,20 @@ class CostTests(unittest.TestCase):
             {"input_tokens": 1, "output_tokens": 2, "cache_read_tokens": 3,
              "cache_write_tokens": 4, "total_tokens": 10})
 
+    def test_accumulate_usage_sums_scalars_and_skips_nested_objects(self):
+        total = {}
+        pipeline.accumulate_usage(total, {"prompt_tokens": 4, "completion_tokens": 6,
+                                          "total_tokens": 10, "prompt_audio_seconds": 20,
+                                          "prompt_tokens_details": {"cached_tokens": 0}})
+        pipeline.accumulate_usage(total, {"prompt_tokens": 1, "completion_tokens": 2,
+                                          "total_tokens": 3, "prompt_audio_seconds": 5,
+                                          "prompt_tokens_details": {"cached_tokens": 0}})
+        self.assertEqual(total, {"prompt_tokens": 5, "completion_tokens": 8,
+                                 "total_tokens": 13, "prompt_audio_seconds": 25})
+        # missing/None usage is a no-op (old cache files have no usage at all)
+        pipeline.accumulate_usage(total, None)
+        self.assertEqual(total["total_tokens"], 13)
+
 
 class AccountingTests(unittest.TestCase):
     def setUp(self):

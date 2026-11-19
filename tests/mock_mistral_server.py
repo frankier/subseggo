@@ -44,7 +44,8 @@ class H(BaseHTTPRequestHandler):
                 {"start": 10.0, "end": 20.0, "text": " world from mock chunk.", "speaker_id": None},
             ],
             "usage": {"prompt_audio_seconds": 20, "prompt_tokens": 4,
-                      "total_tokens": 10, "completion_tokens": 6},
+                      "total_tokens": 10, "completion_tokens": 6,
+                      "prompt_tokens_details": {"cached_tokens": 0}},
         }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

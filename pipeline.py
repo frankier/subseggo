@@ -157,6 +157,17 @@ def transcribe_usage_fields(usage: dict) -> dict:
     }
 
 
+def accumulate_usage(total: dict, usage: dict | None) -> None:
+    """Add the scalar counters of one API usage dict into a running total.
+
+    The API may nest objects inside usage (e.g. token details); only numbers are
+    summed, so nested objects are skipped instead of breaking the addition."""
+    for k, v in (usage or {}).items():
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        total[k] = total.get(k, 0) + v
+
+
 def transcribe_cost_usd(usage: dict) -> float:
     """Cost of one transcription request. Mistral bills transcription per audio hour
     (usage.prompt_audio_seconds); fall back to token pricing if absent."""
@@ -743,8 +754,7 @@ def step_transcribe(workdir: Path, model: str, language: str | None,
                 raw_segs = payload["segments"]
                 # usage of a cached chunk was already recorded in the ledger when the
                 # API call was made; only accumulate it into the transcript totals
-                for k, v in (payload.get("usage") or {}).items():
-                    total_usage[k] = total_usage.get(k, 0) + (v or 0)
+                accumulate_usage(total_usage, payload.get("usage"))
             else:
                 chunk = workdir / f"chunk-{idx:03d}.mp3"
                 log(f"transcribe: chunk {idx} [{start:.0f}s +{dur:.0f}s] of {duration:.0f}s")
@@ -758,8 +768,7 @@ def step_transcribe(workdir: Path, model: str, language: str | None,
                                 detail=f"chunk-{idx:03d} [{start:.0f}s +{dur:.0f}s]",
                                 **transcribe_usage_fields(usage),
                                 cost_usd=transcribe_cost_usd(usage))
-                for k, v in usage.items():
-                    total_usage[k] = total_usage.get(k, 0) + (v or 0)
+                accumulate_usage(total_usage, usage)
                 tmp = cache_file.with_suffix(".tmp")
                 tmp.write_text(json.dumps({"model": model, "usage": usage, "segments": raw_segs}))
                 tmp.rename(cache_file)  # atomic: only complete results are cached
