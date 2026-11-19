@@ -1505,6 +1505,9 @@ def load_config(path: Path) -> tuple[dict, list[dict]]:
         url, p = d.get("url"), d.get("path")
         if bool(url) == bool(p):
             sys.exit(f"ERROR: {where} must have exactly one of 'url' (YouTube) or 'path' (local file)")
+        if p and ("://" in p or re.fullmatch(r"[\w-]{11}", p)):
+            sys.exit(f"ERROR: {where} 'path' looks like a YouTube URL/video ID ({p!r}) -- "
+                     f"use 'url' for YouTube videos, 'path' only for local files")
         unknown = set(d) - DAY_SOURCE_KEYS - set(BUILTIN_DEFAULTS)
         if unknown:
             sys.exit(f"ERROR: unknown keys {sorted(unknown)} in {where}")
