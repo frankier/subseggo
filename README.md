@@ -11,7 +11,11 @@
    (`pi --print --session <workdir>/agent-scratch/pi-session.jsonl --model
    mistral/mistral-large-latest --thinking medium`, plus `--effort medium` when the
    pi build supports it; the literal Mistral-Large-3 id `mistral/mistral-large-2512`
-   can be pinned with `--segment-model`) asking the Mistral-Large model to
+   can be pinned with `--segment-model`). pi always runs with a **bare config**:
+   `PI_CODING_AGENT_DIR` points at a fresh empty dir in `agent-scratch/`, so the
+   user's `~/.pi/agent` (settings, extensions, custom models, auth) is never read —
+   same as inside the Docker image, where no `~/.pi/agent` exists; the API key comes
+   from `MISTRAL_API_KEY` in the environment. The command asks the Mistral-Large model to
    segment hierarchically into **segments (icebreaker/episode) → sections
    (content/exercise/break)** → intermediate format `segments.json`. Days are never
    guessed: with `--config` each video is one day named by its `[[days]]` entry;
@@ -157,7 +161,17 @@ ephemeral `/tmp`, so the agent cannot modify pipeline files (`raw.mp4`,
 `keyframes.json`, `segments.json`, ...) even via shell redirects. It also gets
 only the `read` and `bash` tools (`--tools read,bash`). Network stays up for the
 model API call. With `--sandbox auto` and no `bwrap`, the pipeline warns and runs
-unsandboxed. Unit tests: `uv run --script tests/test_pipeline_units.py`.
+unsandboxed.
+
+Independently of the sandbox, pi never uses the user's `~/.pi/agent`: every pi
+invocation (including the `--help` capability probes) gets `PI_CODING_AGENT_DIR`
+pointing at a freshly emptied `workdir/agent-scratch/pi-agent/`, so pi runs on its
+built-in defaults — the same bare configuration as inside the Docker image. The
+mistral API key is taken from `MISTRAL_API_KEY` in the environment (pi's env-var
+fallback), and the model comes from pi's built-in catalog via `--model`. The bare
+dir lives in `agent-scratch/`, so it is writable both inside the bwrap sandbox
+(the only writable bind) and outside. Unit tests:
+`uv run --script tests/test_pipeline_units.py`.
 - Test the retry/resume logic offline against a mock API:
   `tests/mock_mistral_server.py` (env `FAIL_FIRST=N` fails the first N requests
   with 520, `FAIL_FILE` fails while the file exists), then run with

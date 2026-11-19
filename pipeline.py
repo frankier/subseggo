@@ -23,7 +23,11 @@ edit stages are all cached/skipped automatically):
   3. segment     : `pi` oneshot (Mistral-Large-3, medium effort) over the transcript,
                    run in a bubblewrap read-only sandbox when available (--sandbox;
                    the workdir is read-only except agent-scratch/, so the agent cannot
-                   clobber pipeline files)
+                   clobber pipeline files). pi always runs with a BARE config:
+                   PI_CODING_AGENT_DIR points at a fresh empty dir in agent-scratch,
+                   so the user's ~/.pi/agent (settings, extensions, custom models,
+                   auth) is never read -- same as inside the Docker image; the API
+                   key comes from MISTRAL_API_KEY in the environment
                    -> segments.json (intermediate format: segments > sections; days are
                    never guessed -- with --config each video is one day given by the
                    config entry's title, single-video runs get no day level)
@@ -71,7 +75,9 @@ See config.example.toml.
 
 Requires on PATH: ffmpeg, ffprobe, pi, imagemagick (compare; lets the segment model
 fine-tune cut points visually) (and node as yt-dlp JS runtime, optional).
-Requires env: MISTRAL_API_KEY (for the transcription API; `pi` uses its own auth).
+Requires env: MISTRAL_API_KEY (transcription API and, because the segment pi runs
+with a bare config dir, pi's mistral auth too -- pi falls back to this env var,
+exactly as in the Docker image).
 """
 
 from __future__ import annotations
@@ -107,6 +113,7 @@ DEFAULT_CHAT_USD_PER_1M = {"input": 2.0, "output": 6.0, "cache_read": 0.2, "cach
 
 PI_SESSION_NAME = "pi-session.jsonl"      # pi's native session transcript (JSONL) in the workdir
 PI_TRANSCRIPT_NAME = "pi-transcript.json"  # plain-JSON extraction of it (messages + usage totals)
+PI_AGENT_DIR_NAME = "pi-agent"             # bare pi config dir inside agent-scratch (PI_CODING_AGENT_DIR)
 USAGE_CSV_NAME = "api-usage.csv"
 USAGE_CSV_COLUMNS = ["timestamp", "day", "step", "detail", "model", "requests",
                      "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
@@ -932,17 +939,38 @@ def build_segment_prompt(workdir: Path, segments: list[dict],
         transcript=transcript)
 
 
-def pi_supports_effort(pi_bin: str) -> bool:
+def pi_bare_env(scratch: Path) -> dict[str, str]:
+    """Environment for every pi invocation: PI_CODING_AGENT_DIR points at a fresh,
+    empty dir inside agent-scratch, so pi runs with its built-in defaults (a bare
+    config) and never reads the user's ~/.pi/agent (settings, extensions, custom
+    models, auth) -- exactly like inside the Docker image, where no ~/.pi/agent
+    exists. Auth comes from MISTRAL_API_KEY in the inherited environment (pi's
+    env-var API key fallback), as in the container. The dir lives inside
+    agent-scratch so it is writable both inside the bwrap sandbox (the only
+    writable bind there) and outside; it is recreated empty on every call so no
+    state from a previous run can leak in. The capability probes below must run
+    with this same env so the flags they detect match the ones the oneshot gets."""
+    agent_dir = (scratch / PI_AGENT_DIR_NAME).resolve()
+    shutil.rmtree(agent_dir, ignore_errors=True)
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["PI_CODING_AGENT_DIR"] = str(agent_dir)
+    return env
+
+
+def pi_supports_effort(pi_bin: str, env: dict | None = None) -> bool:
     try:
-        help_out = subprocess.run([pi_bin, "--help"], capture_output=True, text=True).stdout
+        help_out = subprocess.run([pi_bin, "--help"], capture_output=True, text=True,
+                                  env=env).stdout
         return "--effort" in help_out
     except Exception:
         return False
 
 
-def pi_supports_tools(pi_bin: str) -> bool:
+def pi_supports_tools(pi_bin: str, env: dict | None = None) -> bool:
     try:
-        help_out = subprocess.run([pi_bin, "--help"], capture_output=True, text=True).stdout
+        help_out = subprocess.run([pi_bin, "--help"], capture_output=True, text=True,
+                                  env=env).stdout
         return "--tools" in help_out
     except Exception:
         return False
@@ -968,8 +996,9 @@ def bwrap_command(cmd: list[str], workdir: Path) -> list[str]:
     /tmp, so the agent cannot modify pipeline files (raw.mp4, keyframes.json,
     segments.json, ...) even via shell redirects. HOME/TMPDIR point into the
     tmpfs so pi itself writes nothing persistent. Network stays up (the model
-    API call needs it) and the environment (e.g. MISTRAL_API_KEY) passes
-    through."""
+    API call needs it) and the environment (e.g. MISTRAL_API_KEY, and
+    PI_CODING_AGENT_DIR from pi_bare_env, which lands on the writable scratch
+    bind) passes through."""
     scratch = (workdir / "agent-scratch").resolve()
     scratch.mkdir(exist_ok=True)
     return [shutil.which("bwrap"), "--ro-bind", "/", "/",
@@ -983,14 +1012,17 @@ def bwrap_command(cmd: list[str], workdir: Path) -> list[str]:
 
 
 def build_pi_oneshot_cmd(pi_bin: str, model: str, effort: str,
-                         prompt_file: Path, session_file: Path) -> list[str]:
+                         prompt_file: Path, session_file: Path,
+                         env: dict | None = None) -> list[str]:
     """pi oneshot command for the segment stage. The session is persisted to
-    `session_file` (instead of --no-session) so the transcript lands in the workdir."""
+    `session_file` (instead of --no-session) so the transcript lands in the workdir.
+    `env` (from pi_bare_env) is used for the capability probes so the flags probed
+    are the ones available under the bare pi config the oneshot itself runs with."""
     cmd = [pi_bin, "--print", "--session", str(session_file),
            "--model", model, "--thinking", effort, "@" + str(prompt_file.resolve())]
-    if pi_supports_effort(pi_bin):
+    if pi_supports_effort(pi_bin, env):
         cmd += ["--effort", effort]
-    if pi_supports_tools(pi_bin):
+    if pi_supports_tools(pi_bin, env):
         # the segment task only needs read (prompt/frames/keyframes.json) and
         # bash (ffprobe/ffmpeg/compare); never the write/edit tools
         cmd += ["--tools", "read,bash"]
@@ -1052,12 +1084,18 @@ def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
         session_scratch = scratch / PI_SESSION_NAME
         session_scratch.unlink(missing_ok=True)  # fresh session per attempt
         (workdir / PI_SESSION_NAME).unlink(missing_ok=True)
-        cmd = build_pi_oneshot_cmd(pi_bin, model, effort, prompt_file, session_scratch)
+        # bare pi config: PI_CODING_AGENT_DIR -> empty dir in agent-scratch, so pi
+        # never picks up the user's ~/.pi/agent (sandboxed or not -- inside bwrap
+        # the env passes through and the dir is on the writable scratch bind)
+        env = pi_bare_env(scratch)
+        cmd = build_pi_oneshot_cmd(pi_bin, model, effort, prompt_file, session_scratch,
+                                   env=env)
         if will_sandbox:
             cmd = bwrap_command(cmd, workdir)
-        log(f"segment: running pi oneshot{' in bwrap sandbox' if will_sandbox else ''}: "
+        log(f"segment: running pi oneshot{' in bwrap sandbox' if will_sandbox else ''} "
+            f"with bare config (PI_CODING_AGENT_DIR={env['PI_CODING_AGENT_DIR']}): "
             f"{' '.join(cmd[:8])} ...")
-        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir)
+        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir, env=env)
         save_pi_transcript(workdir, session_scratch, acct, model)
         if proc.returncode != 0:
             sys.exit(f"ERROR: pi failed (rc={proc.returncode}):\n{proc.stderr[-3000:]}")

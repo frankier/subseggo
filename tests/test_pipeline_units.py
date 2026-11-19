@@ -299,6 +299,48 @@ class PiOneshotCmdTests(unittest.TestCase):
         self.assertNotIn("--effort", cmd)
         self.assertNotIn("--tools", cmd)
 
+    def test_probes_run_with_the_same_env_as_the_oneshot(self):
+        env = {"PI_CODING_AGENT_DIR": "/x/pi-agent"}
+        with mock.patch.object(pipeline, "pi_supports_effort", return_value=False) as m_eff, \
+                mock.patch.object(pipeline, "pi_supports_tools", return_value=True) as m_tools:
+            pipeline.build_pi_oneshot_cmd("pi", "m", "medium", Path("/w/p.md"),
+                                          Path("/w/s.jsonl"), env=env)
+        m_eff.assert_called_once_with("pi", env)
+        m_tools.assert_called_once_with("pi", env)
+
+
+class PiBareEnvTests(unittest.TestCase):
+    """pi must run with a bare config (PI_CODING_AGENT_DIR -> empty dir in
+    agent-scratch), never the user's ~/.pi/agent -- also outside the sandbox."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.scratch = self.dir / "agent-scratch"
+        self.scratch.mkdir()
+
+    def test_bare_env_points_at_fresh_empty_dir_in_scratch(self):
+        stale = self.scratch / pipeline.PI_AGENT_DIR_NAME
+        stale.mkdir()
+        (stale / "settings.json").write_text('{"packages": ["npm:evil"]}')  # must be wiped
+        env = pipeline.pi_bare_env(self.scratch)
+        agent_dir = Path(env["PI_CODING_AGENT_DIR"])
+        self.assertEqual(agent_dir, (self.scratch / pipeline.PI_AGENT_DIR_NAME).resolve())
+        self.assertTrue(agent_dir.is_dir())
+        self.assertEqual(list(agent_dir.iterdir()), [])  # bare: no settings/extensions left
+        # the pipeline's own process env is not mutated, the rest passes through
+        self.assertNotIn("PI_CODING_AGENT_DIR", os.environ)
+        self.assertEqual(env.get("PATH"), os.environ.get("PATH"))
+
+    def test_bare_env_dir_is_inside_the_bwrap_writable_bind(self):
+        # bwrap_command makes only agent-scratch writable; the bare pi dir must
+        # live there so pi can write its cache/auth inside the sandbox too
+        with mock.patch.object(pipeline.shutil, "which", return_value="/usr/bin/bwrap"):
+            cmd = pipeline.bwrap_command(["pi", "-p", "hi"], self.dir)
+        i = cmd.index("--bind")
+        writable = Path(cmd[i + 1])
+        env = pipeline.pi_bare_env(self.dir / "agent-scratch")
+        self.assertEqual(Path(env["PI_CODING_AGENT_DIR"]).parent, writable)
+
 
 class StepSegmentTranscriptTests(unittest.TestCase):
     """step_segment end-to-end with a fake pi: the session file must land in the
@@ -344,6 +386,26 @@ class StepSegmentTranscriptTests(unittest.TestCase):
         self.assertEqual(rows[0]["model"], "mistral-large-2512")
         self.assertEqual(rows[0]["requests"], "2")
         self.assertAlmostEqual(float(rows[0]["cost_usd"]), 5.4e-5 + 8.2e-5, places=9)
+
+    def test_segment_runs_pi_with_bare_agent_dir(self):
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured.update(kw)
+            return self._fake_pi_run(cmd, **kw)
+
+        with mock.patch.object(pipeline, "probe_duration", return_value=100.0), \
+                mock.patch.object(pipeline, "pi_supports_effort", return_value=False), \
+                mock.patch.object(pipeline, "pi_supports_tools", return_value=True), \
+                mock.patch.object(pipeline.subprocess, "run", side_effect=fake_run):
+            pipeline.step_segment(self.workdir, "m", "medium", "pi", None,
+                                  day_title="Day 1", sandbox="none", acct=self.acct)
+        env = captured.get("env") or {}
+        agent_dir = Path(env["PI_CODING_AGENT_DIR"])
+        self.assertEqual(agent_dir.parent, (self.workdir / "agent-scratch").resolve())
+        self.assertEqual(agent_dir.name, pipeline.PI_AGENT_DIR_NAME)
+        self.assertTrue(agent_dir.is_dir())
+        self.assertEqual(list(agent_dir.iterdir()), [])
 
     def test_save_pi_transcript_without_session_file(self):
         self.assertIsNone(pipeline.save_pi_transcript(self.workdir, self.dir / "nope.jsonl",
