@@ -12,8 +12,9 @@
 #   height, language, transcribe_model, segment_model, effort, chunk_minutes,
 #   subs ("embed"|"burn"|"sidecar"), reencode, no_combined, pi_bin,
 #   skip_download, skip_transcribe, skip_segment, skip_edit, force_edit,
-#   no_snap_keyframes, max_retries, retry_base_seconds, retry_max_seconds,
-#   mock_transcript, mock_segments, workdir_root
+#   no_snap_keyframes, sandbox ("auto"|"bwrap"|"none"), max_retries,
+#   retry_base_seconds, retry_max_seconds, mock_transcript, mock_segments,
+#   workdir_root
 
 workdir_root = "work"   # per-day workdirs are created under this dir
 height = 1080

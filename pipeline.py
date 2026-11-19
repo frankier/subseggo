@@ -20,7 +20,10 @@ edit stages are all cached/skipped automatically):
   1. download    : yt-dlp grabs the YouTube video as raw.mp4 (+ raw.info.json)
   2. transcribe  : audio chunks -> Mistral /v1/audio/transcriptions (Voxtral-3-small)
                    -> transcript.json (segments) + raw.srt
-  3. segment     : `pi` oneshot (Mistral-Large-3, medium effort) over the transcript
+  3. segment     : `pi` oneshot (Mistral-Large-3, medium effort) over the transcript,
+                   run in a bubblewrap read-only sandbox when available (--sandbox;
+                   the workdir is read-only except agent-scratch/, so the agent cannot
+                   clobber pipeline files)
                    -> segments.json (intermediate format: segments > sections; days are
                    never guessed -- with --config each video is one day given by the
                    config entry's title, single-video runs get no day level)
@@ -28,7 +31,10 @@ edit stages are all cached/skipped automatically):
                    -> per-segment mp4 outputs with break sections removed,
                       plus the original mp4 with subtitles applied.
                    Cut points are snapped to video keyframes (raw.mp4 is probed once,
-                   cached in workdir/keyframes.json) so the stream-copied cuts start
+                   right after download, cached in workdir/keyframes.json; the cache
+                   is fingerprint-bound to raw.mp4, validated on read and written
+                   atomically, so a stale/corrupt cache is re-probed, not fatal)
+                   so the stream-copied cuts start
                    exactly where the editlist says -- otherwise each range's video
                    begins at the next keyframe and the (nominal-time) subtitles drift
                    against it, accumulating a visible offset at every cut. A sync
@@ -53,6 +59,7 @@ Requires env: MISTRAL_API_KEY (for the transcription API; `pi` uses its own auth
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -183,8 +190,97 @@ def probe_keyframes(mp4: Path) -> list[list[float]]:
     for line in out.splitlines():
         parts = line.split(",")
         if len(parts) == 3 and "K" in parts[2]:
-            kfs.append([float(parts[0]), float(parts[1])])
+            try:
+                kfs.append([float(parts[0]), float(parts[1])])
+            except ValueError:  # pts/dts can be "N/A"
+                continue
     return sorted(kfs)
+
+
+KF_CACHE_VERSION = 1
+KF_FINGERPRINT_BYTES = 1 << 20  # first 1 MiB
+
+
+def file_fingerprint(mp4: Path) -> dict:
+    """Cheap identity of the source video a keyframe cache belongs to: size plus
+    sha256 of the first 1 MiB. A re-download of a *different* video virtually
+    always differs here; the same video re-downloaded byte-identical stays valid
+    (and correctly so -- same keyframes)."""
+    st = mp4.stat()
+    h = hashlib.sha256()
+    with mp4.open("rb") as f:
+        h.update(f.read(KF_FINGERPRINT_BYTES))
+    return {"size": st.st_size, "head_sha256": h.hexdigest()}
+
+
+def write_keyframe_cache(path: Path, mp4: Path, kfs: list[list[float]]) -> None:
+    """Write the keyframe cache atomically (tmp file + rename), so an interrupted
+    run can never leave a half-written cache behind."""
+    payload = {"version": KF_CACHE_VERSION, "source": mp4.name,
+               "fingerprint": file_fingerprint(mp4), "keyframes": kfs}
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload))
+    os.replace(tmp, path)
+
+
+def load_keyframe_cache(path: Path, mp4: Path) -> list[list[float]] | None:
+    """Cached keyframes if `path` is a valid cache for the current `mp4`, else None.
+
+    A corrupt or foreign cache file (e.g. raw ffprobe CSV that the segment agent
+    redirected into it) is moved aside to <name>.bad-<timestamp> and None is
+    returned, so the caller re-probes raw.mp4 instead of crashing. A well-formed
+    cache whose fingerprint does not match the current raw.mp4 is stale and also
+    ignored (it gets overwritten by the next write)."""
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+        raw = payload["keyframes"]
+        if payload.get("version") != KF_CACHE_VERSION:
+            raise ValueError(f"unsupported cache version {payload.get('version')!r}")
+        if payload.get("fingerprint") != file_fingerprint(mp4):
+            log(f"cache: {path.name} was probed from a different raw.mp4 "
+                f"(fingerprint mismatch) -- ignoring it")
+            return None
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("'keyframes' is not a non-empty list")
+        kfs = []
+        for kf in raw:
+            # tolerate an older cache that stored bare pts values instead of [pts, dts]
+            pair = kf if isinstance(kf, list) else [kf, kf]
+            if (len(pair) != 2
+                    or not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                               for v in pair)):
+                raise ValueError(f"bad keyframe entry {kf!r}")
+            kfs.append([float(pair[0]), float(pair[1])])
+        return kfs
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        bad = path.with_name(f"{path.name}.bad-{int(time.time())}")
+        log(f"WARNING: {path.name} is not a valid keyframe cache ({e}); "
+            f"moving it aside to {bad.name} and re-probing {mp4.name}")
+        try:
+            os.replace(path, bad)
+        except OSError:
+            pass
+        return None
+
+
+def ensure_keyframe_cache(workdir: Path) -> None:
+    """Probe raw.mp4 keyframes once, right after download, so a valid
+    keyframes.json already exists before the segment agent runs (it only needs
+    to READ it). The edit stage reuses the same cache."""
+    raw_mp4 = workdir / "raw.mp4"
+    kf_cache = workdir / "keyframes.json"
+    if not raw_mp4.exists():
+        return
+    kfs = load_keyframe_cache(kf_cache, raw_mp4)
+    if kfs is not None:
+        log(f"keyframes: loaded {len(kfs)} keyframes from {kf_cache.name}")
+        return
+    log("keyframes: probing video keyframes of raw.mp4 (cached in keyframes.json)")
+    kfs = probe_keyframes(raw_mp4)
+    write_keyframe_cache(kf_cache, raw_mp4, kfs)
+    log(f"keyframes: {len(kfs)} keyframes -> {kf_cache.name}")
 
 
 def snap_to_keyframe(t: float, kfs: list[list[float]]) -> float:
@@ -443,23 +539,20 @@ VISUAL FINE-TUNING (optional, but recommended for precise boundaries):
 The original video is available as raw.mp4 in the directory containing this prompt
 file, and ffmpeg/ffprobe and ImageMagick are installed on PATH. After picking a cut
 point from the transcript, refine it using the visuals:
-- List the video keyframes (packets whose flags contain K) with their timestamps:
-    ffprobe -v error -select_streams v:0 -show_entries packet=pts_time,dts_time,flags -of csv=p=0 raw.mp4
-  (if a previous edit run left keyframes.json in this directory, read the keyframe
-  list from there instead of probing again)
-- Extract the frame at time t as a PNG:
-    ffmpeg -y -ss <t> -i raw.mp4 -frames:v 1 frame.png
+{kf_note}
+- Extract the frame at time t as a PNG (into the scratch dir):
+    ffmpeg -y -ss <t> -i raw.mp4 -frames:v 1 agent-scratch/frame.png
 - Measure the visual difference between two frames with ImageMagick:
-    compare -metric AE frame_a.png frame_b.png null:
+    compare -metric AE agent-scratch/frame_a.png agent-scratch/frame_b.png null:
   (also try -metric RMSE; a large value means the picture changed -- a scene/slide/
   camera cut; `compare` can also write a highlighted diff image instead of null:)
 - You are a multimodal model: read the extracted PNGs and look at them directly to
   see where the picture actually changes (slide transitions, camera cuts,
   screen-share start/stop, black or break frames).
-
+{sandbox_note}
 KEYFRAME CUTS:
 The edit stage cuts with stream copy, so every cut point must be a video keyframe
-(use the ffprobe keyframe listing above). When fine-tuning a boundary, snap it to a
+(use the keyframe list above). When fine-tuning a boundary, snap it to a
 keyframe:
 - At the BEGINNING of a segment, seek BACKWARDS to the previous keyframe: a start
   time inside a GOP makes the stream-copied cut begin at the NEXT keyframe instead,
@@ -493,9 +586,41 @@ def fmt_hms(t: float) -> str:
 
 
 def build_segment_prompt(workdir: Path, segments: list[dict],
-                         day_title: str | None = None) -> str:
+                         day_title: str | None = None, sandboxed: bool = False) -> str:
     info = json.loads((workdir / "raw.info.json").read_text())
     duration = probe_duration(workdir / "raw.mp4")
+    kf_ok = load_keyframe_cache(workdir / "keyframes.json", workdir / "raw.mp4") is not None
+    if kf_ok:
+        kf_note = (
+            "- The video keyframes (packets whose flags contain K) have ALREADY been probed\n"
+            "  by the pipeline and stored as JSON in keyframes.json in this directory:\n"
+            "      {\"version\": 1, \"source\": \"raw.mp4\", \"fingerprint\": {...}, \"keyframes\": [[pts, dts], ...]}\n"
+            "  (times in seconds, sorted by pts). READ that file, e.g.:\n"
+            "      python3 -c \"import json; print(json.load(open('keyframes.json'))['keyframes'])\"\n"
+            "  Do NOT run ffprobe again, and NEVER create, overwrite or delete keyframes.json\n"
+            "  or any other pipeline file."
+        )
+    else:
+        kf_note = (
+            "- List the video keyframes (packets whose flags contain K) with their timestamps,\n"
+            "  writing the raw listing into the scratch dir only:\n"
+            "      ffprobe -v error -select_streams v:0 -show_entries packet=pts_time,dts_time,flags -of csv=p=0 raw.mp4 > agent-scratch/packets.csv\n"
+            "  (each CSV line is pts,dts,flags; a flags field containing K = keyframe)"
+        )
+    if sandboxed:
+        sandbox_note = (
+            "FILE ACCESS: this directory is mounted READ-ONLY for you (bubblewrap sandbox).\n"
+            "Write ALL scratch files -- frames, packet CSVs, helper scripts, notes -- into the\n"
+            "agent-scratch/ subdirectory only; writes anywhere else will fail. keyframes.json,\n"
+            "segments.json, raw.mp4, raw.srt, transcript.* and segment-prompt.md are\n"
+            "pipeline-owned and protected."
+        )
+    else:
+        sandbox_note = (
+            "FILE ACCESS: never create, overwrite or delete pipeline files (keyframes.json,\n"
+            "segments.json, raw.mp4, raw.srt, transcript.*, segment-prompt.md). Write ALL\n"
+            "scratch files (frames, packet CSVs, helper scripts) into agent-scratch/ only."
+        )
     # compact transcript: [hh:mm:ss] text
     lines = []
     for s in segments:
@@ -514,7 +639,7 @@ def build_segment_prompt(workdir: Path, segments: list[dict],
             f'segment only the segments/sections within this video.\n'
         )
     return SEGMENT_PROMPT.format(
-        day_mode=day_mode,
+        day_mode=day_mode, kf_note=kf_note, sandbox_note=sandbox_note,
         title=info.get("title", ""), uploader=info.get("uploader", ""),
         duration=duration, duration_hms=fmt_hms(duration),
         description=(info.get("description") or "")[:8000],
@@ -529,8 +654,51 @@ def pi_supports_effort(pi_bin: str) -> bool:
         return False
 
 
+def pi_supports_tools(pi_bin: str) -> bool:
+    try:
+        help_out = subprocess.run([pi_bin, "--help"], capture_output=True, text=True).stdout
+        return "--tools" in help_out
+    except Exception:
+        return False
+
+
+def resolve_sandbox(mode: str) -> bool:
+    """Whether the pi run will be wrapped in a bwrap read-only sandbox.
+    mode "auto": bwrap if on PATH, else unsandboxed with a warning;
+    mode "bwrap": require bwrap; mode "none": never sandbox."""
+    if mode == "none":
+        return False
+    if shutil.which("bwrap"):
+        return True
+    if mode == "bwrap":
+        sys.exit("ERROR: --sandbox bwrap but bwrap is not on PATH")
+    log("segment: WARNING bwrap not found; running pi WITHOUT a filesystem sandbox")
+    return False
+
+
+def bwrap_command(cmd: list[str], workdir: Path) -> list[str]:
+    """Wrap `cmd` in a bubblewrap sandbox: the whole filesystem is mounted
+    read-only except workdir/agent-scratch/ (created here) and an ephemeral
+    /tmp, so the agent cannot modify pipeline files (raw.mp4, keyframes.json,
+    segments.json, ...) even via shell redirects. HOME/TMPDIR point into the
+    tmpfs so pi itself writes nothing persistent. Network stays up (the model
+    API call needs it) and the environment (e.g. MISTRAL_API_KEY) passes
+    through."""
+    scratch = (workdir / "agent-scratch").resolve()
+    scratch.mkdir(exist_ok=True)
+    return [shutil.which("bwrap"), "--ro-bind", "/", "/",
+            "--bind", str(scratch), str(scratch),
+            "--dev-bind", "/dev", "/dev", "--proc", "/proc",
+            "--tmpfs", "/tmp",
+            "--setenv", "HOME", "/tmp/pi-home",
+            "--setenv", "TMPDIR", "/tmp",
+            "--dir", "/tmp/pi-home",
+            "--"] + cmd
+
+
 def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
-                 mock_segments: Path | None, day_title: str | None = None) -> dict:
+                 mock_segments: Path | None, day_title: str | None = None,
+                 sandbox: str = "auto") -> dict:
     """Segment one video into segments > sections. day_title (config mode only) is
     the day this video belongs to, given by the caller -- passed to the prompt as
     context; the model never guesses days."""
@@ -544,7 +712,9 @@ def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
         data = json.loads(mock_segments.read_text())
     else:
         transcript = json.loads((workdir / "transcript.json").read_text())["segments"]
-        prompt = build_segment_prompt(workdir, transcript, day_title=day_title)
+        will_sandbox = resolve_sandbox(sandbox)
+        prompt = build_segment_prompt(workdir, transcript, day_title=day_title,
+                                      sandboxed=will_sandbox)
         prompt_file = workdir / "segment-prompt.md"
         prompt_file.write_text(prompt)
         log(f"segment: prompt is {len(prompt)} chars -> {prompt_file}")
@@ -552,7 +722,14 @@ def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
                "--thinking", effort, "@" + str(prompt_file.resolve())]
         if pi_supports_effort(pi_bin):
             cmd += ["--effort", effort]
-        log(f"segment: running pi oneshot: {' '.join(cmd[:8])} ...")
+        if pi_supports_tools(pi_bin):
+            # the segment task only needs read (prompt/frames/keyframes.json) and
+            # bash (ffprobe/ffmpeg/compare); never the write/edit tools
+            cmd += ["--tools", "read,bash"]
+        if will_sandbox:
+            cmd = bwrap_command(cmd, workdir)
+        log(f"segment: running pi oneshot{' in bwrap sandbox' if will_sandbox else ''}: "
+            f"{' '.join(cmd[:8])} ...")
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir)
         if proc.returncode != 0:
             sys.exit(f"ERROR: pi failed (rc={proc.returncode}):\n{proc.stderr[-3000:]}")
@@ -730,15 +907,13 @@ def step_edit(workdir: Path, data: dict, subs: str, reencode: bool, combined: bo
     kfs: list[list[float]] | None = None
     if snap_keyframes:
         kf_cache = workdir / "keyframes.json"
-        if kf_cache.exists():
-            raw_kfs = json.loads(kf_cache.read_text())["keyframes"]
-            # tolerate an older cache that stored bare pts values instead of [pts, dts]
-            kfs = [kf if isinstance(kf, list) else [kf, kf] for kf in raw_kfs]
+        kfs = load_keyframe_cache(kf_cache, workdir / "raw.mp4")
+        if kfs is not None:
             log(f"edit: loaded {len(kfs)} keyframes from {kf_cache.name}")
         else:
             log("edit: probing video keyframes of raw.mp4 (cached in keyframes.json)")
             kfs = probe_keyframes(workdir / "raw.mp4")
-            kf_cache.write_text(json.dumps({"keyframes": kfs}))
+            write_keyframe_cache(kf_cache, workdir / "raw.mp4", kfs)
             log(f"edit: {len(kfs)} keyframes found")
     doc = build_editlist_yaml(data, combined=combined, keyframes=kfs)
     editlist_yaml = workdir / "editlist.yaml"
@@ -855,6 +1030,7 @@ BUILTIN_DEFAULTS = {
     "skip_edit": False,
     "force_edit": False,
     "no_snap_keyframes": False,
+    "sandbox": "auto",
     "max_retries": 5,
     "retry_base_seconds": 2.0,
     "retry_max_seconds": 120.0,
@@ -907,6 +1083,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="do not snap editlist cut points to video keyframes (stream-copied cuts "
                          "then start at the next keyframe and subtitles drift; the sync report "
                          "in out/sync-report.txt is still written)")
+    ap.add_argument("--sandbox", choices=["auto", "bwrap", "none"], default=None,
+                    help="sandbox the pi segment agent in a bubblewrap read-only mount: the "
+                         "workdir is read-only except workdir/agent-scratch/ (default: auto = "
+                         "bwrap when on PATH, else unsandboxed with a warning)")
     ap.add_argument("--max-retries", type=int, default=None,
                     help="per-chunk transcription retry limit (5xx/429/network errors)")
     ap.add_argument("--retry-base-seconds", type=float, default=None,
@@ -931,6 +1111,8 @@ def _norm_keys(table: dict, where: str) -> dict:
             v = Path(v)
         if key == "subs" and v not in ("embed", "burn", "sidecar"):
             sys.exit(f"ERROR: subs must be embed|burn|sidecar, got {v!r} in {where}")
+        if key == "sandbox" and v not in ("auto", "bwrap", "none"):
+            sys.exit(f"ERROR: sandbox must be auto|bwrap|none, got {v!r} in {where}")
         out[key] = v
     return out
 
@@ -1010,6 +1192,11 @@ def run_pipeline(opt: dict, source: dict, day_title: str | None) -> None:
     else:
         log("download: skipped")
 
+    if not opt["no_snap_keyframes"]:
+        # probe keyframes once, right after download, so a valid keyframes.json
+        # exists before the segment agent runs (it only needs to read it)
+        ensure_keyframe_cache(workdir)
+
     if not opt["skip_transcribe"]:
         step_transcribe(workdir, opt["transcribe_model"], opt["language"],
                         opt["chunk_minutes"], opt["mock_transcript"],
@@ -1020,7 +1207,8 @@ def run_pipeline(opt: dict, source: dict, day_title: str | None) -> None:
 
     if not opt["skip_segment"]:
         data = step_segment(workdir, opt["segment_model"], opt["effort"],
-                            opt["pi_bin"], opt["mock_segments"], day_title=day_title)
+                            opt["pi_bin"], opt["mock_segments"], day_title=day_title,
+                            sandbox=opt["sandbox"])
     else:
         log("segment: skipped")
         data = json.loads((workdir / "segments.json").read_text())

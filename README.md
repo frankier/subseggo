@@ -92,7 +92,8 @@ segment model fine-tunes cut points visually), `pi`, `node` (yt-dlp JS runtime).
 Options: `--language en`, `--subs embed|burn|sidecar`, `--reencode`,
 `--transcribe-model`, `--segment-model`, `--effort`, `--chunk-minutes`,
 `--skip-download/--skip-transcribe/--skip-segment/--skip-edit`, `--force-edit`,
-`--no-snap-keyframes`, `--mock-transcript`, `--mock-segments` (offline testing).
+`--no-snap-keyframes`, `--sandbox auto|bwrap|none`, `--mock-transcript`,
+`--mock-segments` (offline testing).
 See `--help`.
 
 ## Retries and resuming a partial run
@@ -108,6 +109,23 @@ See `--help`.
   `raw.mp4`, `transcript.json`, `segments.json` and the `.edit-done` marker make
   download/transcribe/segment/edit resumable; `--skip-*` forces skipping a stage
   and `--force-edit` redoes the edit stage.
+- `workdir/keyframes.json` (the video keyframe probe used for cut snapping) is
+  probed once right after download and cached with a fingerprint of `raw.mp4`
+  (size + sha256 of the first 1 MiB). The cache is written atomically and
+  validated on read: a corrupt or foreign file is moved aside to
+  `keyframes.json.bad-*` and re-probed, and a cache from a different `raw.mp4`
+  is ignored -- neither crashes the pipeline.
+
+## Sandboxing the segment agent
+
+The `pi` oneshot that segments the video is run inside a bubblewrap sandbox
+(`--sandbox auto`, the default; `bwrap` must be on PATH, `none` disables): the
+whole filesystem is mounted read-only except `workdir/agent-scratch/` and an
+ephemeral `/tmp`, so the agent cannot modify pipeline files (`raw.mp4`,
+`keyframes.json`, `segments.json`, ...) even via shell redirects. It also gets
+only the `read` and `bash` tools (`--tools read,bash`). Network stays up for the
+model API call. With `--sandbox auto` and no `bwrap`, the pipeline warns and runs
+unsandboxed. Unit tests: `uv run --script tests/test_pipeline_units.py`.
 - Test the retry/resume logic offline against a mock API:
   `tests/mock_mistral_server.py` (env `FAIL_FIRST=N` fails the first N requests
   with 520, `FAIL_FILE` fails while the file exists), then run with
