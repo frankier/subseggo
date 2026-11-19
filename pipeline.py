@@ -42,6 +42,24 @@ edit stages are all cached/skipped automatically):
                    video range starts match the nominal editlist times (--no-snap-keyframes
                    disables the snapping).
 
+Transcripts & API accounting:
+  - the pi oneshot of stage 3 runs with --session, so pi's transcript is persisted:
+    workdir/pi-session.jsonl (pi's native JSONL session, written incrementally, so it
+    survives even a crashed run; inside the bwrap sandbox it is written to the writable
+    agent-scratch/ and copied out afterwards) and workdir/pi-transcript.json (a plain-JSON
+    extraction of it: messages with text/tool calls/tool results, per-message usage, and
+    summed token+cost totals).
+  - every API request is recorded as one row in an api-usage.csv ledger, itemized per
+    day/step: config mode keeps one CSV at the workdir root (workdir_root/api-usage.csv,
+    rows carry a day column); single-video mode keeps it in the video's workdir
+    (workdir/api-usage.csv). Columns: timestamp, day, step, detail, model, requests,
+    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+    audio_seconds, cost_usd. Costs come from the API usage (transcription: billed per
+    audio hour; pi segment run: pi's own catalog-derived cost in the session) with
+    env-overridable list prices as fallback (MISTRAL_TRANSCRIBE_USD_PER_AUDIO_HOUR,
+    MISTRAL_USD_PER_1M_INPUT/OUTPUT/CACHE_READ/CACHE_WRITE). After any command the
+    pipeline prints the API usage of the run and the ledger total.
+
 Usage:
   uv run --script pipeline.py "https://www.youtube.com/watch?v=VIDEO_ID" [options]
   uv run --script pipeline.py --config event.toml [options]
@@ -59,6 +77,7 @@ Requires env: MISTRAL_API_KEY (for the transcription API; `pi` uses its own auth
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -79,6 +98,20 @@ DEFAULT_SEGMENT_MODEL = "mistral/mistral-large-latest"     # Mistral Large line 
 DEFAULT_EFFORT = "medium"
 API_MAX_CHUNK_MINUTES = 55  # API limit is 60 min / 500 MB per request; stay under
 
+# List prices used to turn API usage into USD (the APIs return usage, not cost).
+# pi reports its own catalog-derived cost in the session transcript; these are the
+# fallback for chat tokens and the primary source for transcription (billed per audio
+# hour). Override via env if Mistral changes pricing.
+DEFAULT_TRANSCRIBE_USD_PER_AUDIO_HOUR = 0.24   # voxtral-small-transcribe-3
+DEFAULT_CHAT_USD_PER_1M = {"input": 2.0, "output": 6.0, "cache_read": 0.2, "cache_write": 0.0}  # Mistral Large line
+
+PI_SESSION_NAME = "pi-session.jsonl"      # pi's native session transcript (JSONL) in the workdir
+PI_TRANSCRIPT_NAME = "pi-transcript.json"  # plain-JSON extraction of it (messages + usage totals)
+USAGE_CSV_NAME = "api-usage.csv"
+USAGE_CSV_COLUMNS = ["timestamp", "day", "step", "detail", "model", "requests",
+                     "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+                     "total_tokens", "audio_seconds", "cost_usd"]
+
 
 def log(msg: str) -> None:
     print(f"[pipeline {time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -94,6 +127,237 @@ def which_or_die(name: str) -> str:
     if not p:
         sys.exit(f"ERROR: '{name}' not found on PATH (install it or use the Docker image)")
     return p
+
+
+# --------------------------------------------------------------------------- #
+# API accounting (usage ledger CSV) and pi transcript extraction
+# --------------------------------------------------------------------------- #
+
+def chat_price_per_1m(kind: str) -> float:
+    """USD per 1M tokens for a chat-usage kind (input/output/cache_read/cache_write),
+    env-overridable via MISTRAL_USD_PER_1M_<KIND>."""
+    return float(os.environ.get(f"MISTRAL_USD_PER_1M_{kind.upper()}",
+                                DEFAULT_CHAT_USD_PER_1M[kind]))
+
+
+def transcribe_usage_fields(usage: dict) -> dict:
+    """Mistral /v1/audio/transcriptions usage -> accounting fields."""
+    return {
+        "input_tokens": int(usage.get("prompt_tokens") or 0),
+        "output_tokens": int(usage.get("completion_tokens") or 0),
+        "total_tokens": int(usage.get("total_tokens") or 0),
+        "audio_seconds": float(usage.get("prompt_audio_seconds") or 0.0),
+    }
+
+
+def transcribe_cost_usd(usage: dict) -> float:
+    """Cost of one transcription request. Mistral bills transcription per audio hour
+    (usage.prompt_audio_seconds); fall back to token pricing if absent."""
+    per_hour = float(os.environ.get("MISTRAL_TRANSCRIBE_USD_PER_AUDIO_HOUR",
+                                    DEFAULT_TRANSCRIBE_USD_PER_AUDIO_HOUR))
+    secs = usage.get("prompt_audio_seconds")
+    if secs:
+        return float(secs) / 3600.0 * per_hour
+    return ((usage.get("prompt_tokens") or 0) * chat_price_per_1m("input")
+            + (usage.get("completion_tokens") or 0) * chat_price_per_1m("output")) / 1e6
+
+
+def estimate_chat_cost_usd(totals: dict) -> float:
+    """Fallback USD cost of pi usage totals (pi usually reports cost itself in the
+    session; this is for sessions without it)."""
+    return (totals.get("input", 0) * chat_price_per_1m("input")
+            + totals.get("output", 0) * chat_price_per_1m("output")
+            + totals.get("cacheRead", 0) * chat_price_per_1m("cache_read")
+            + totals.get("cacheWrite", 0) * chat_price_per_1m("cache_write")) / 1e6
+
+
+def pi_usage_fields(totals: dict) -> dict:
+    """pi session usage totals -> accounting fields."""
+    return {
+        "input_tokens": int(totals.get("input") or 0),
+        "output_tokens": int(totals.get("output") or 0),
+        "cache_read_tokens": int(totals.get("cacheRead") or 0),
+        "cache_write_tokens": int(totals.get("cacheWrite") or 0),
+        "total_tokens": int(totals.get("totalTokens") or 0),
+    }
+
+
+def _sum_rows(rows: list[dict]) -> dict:
+    keys = ["requests", "input_tokens", "output_tokens", "cache_read_tokens",
+            "cache_write_tokens", "total_tokens", "audio_seconds", "cost_usd"]
+    out = {k: 0.0 for k in keys}
+    for r in rows:
+        for k in keys:
+            out[k] += float(r.get(k) or 0)
+    return out
+
+
+def _fmt_totals(t: dict) -> str:
+    s = (f"{int(t['requests'])} req, tokens in/out/total "
+         f"{int(t['input_tokens'])}/{int(t['output_tokens'])}/{int(t['total_tokens'])}")
+    if t["cache_read_tokens"] or t["cache_write_tokens"]:
+        s += f" (cache r/w {int(t['cache_read_tokens'])}/{int(t['cache_write_tokens'])})"
+    if t["audio_seconds"]:
+        s += f", audio {t['audio_seconds']:.0f}s"
+    s += f", ${t['cost_usd']:.4f}"
+    return s
+
+
+class Accounting:
+    """Append-only ledger of API spend: one CSV row per API request, itemized per
+    day/step. Also keeps this run's rows in memory for the end-of-command report.
+
+    In config mode the CSV lives at the workdir root (one per event, rows carry the
+    day); in single-video mode in the video's workdir."""
+
+    def __init__(self, csv_path: Path, day: str):
+        self.csv_path = Path(csv_path)
+        self.day = day
+        self.rows: list[dict] = []
+
+    def record(self, *, step: str, detail: str, model: str, requests: int = 1,
+               input_tokens: int = 0, output_tokens: int = 0, cache_read_tokens: int = 0,
+               cache_write_tokens: int = 0, total_tokens: int = 0, audio_seconds: float = 0.0,
+               cost_usd: float = 0.0) -> dict:
+        row = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), "day": self.day, "step": step,
+               "detail": detail, "model": model, "requests": int(requests),
+               "input_tokens": int(input_tokens), "output_tokens": int(output_tokens),
+               "cache_read_tokens": int(cache_read_tokens), "cache_write_tokens": int(cache_write_tokens),
+               "total_tokens": int(total_tokens), "audio_seconds": round(float(audio_seconds), 3),
+               "cost_usd": round(float(cost_usd), 6)}
+        self.rows.append(row)
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        new = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
+        with self.csv_path.open("a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=USAGE_CSV_COLUMNS)
+            if new:
+                w.writeheader()
+            w.writerow(row)
+        log(f"api: [{self.day}] {step} {detail} model={model} {_fmt_totals(_sum_rows([row]))} "
+            f"-> {self.csv_path}")
+        return row
+
+    def run_totals(self) -> dict:
+        return _sum_rows(self.rows)
+
+
+def ledger_rows(csv_path: Path) -> list[dict]:
+    """All rows recorded so far in a usage CSV (empty if there is none yet)."""
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        return []
+    with csv_path.open(newline="") as f:
+        return [r for r in csv.DictReader(f) if r.get("step")]
+
+
+def report_api_usage(accts: list["Accounting"]) -> None:
+    """Print the API usage of this run plus the ledger totals of each usage CSV.
+    Called after any command (even a failed one) from main()'s finally block."""
+    if not accts:
+        return
+    log("=== API usage this run ===")
+    for acct in accts:
+        if not acct.rows:
+            log(f"  [{acct.day}] no new API calls (stages cached/skipped, or mocked)")
+            continue
+        groups: dict[str, list[dict]] = {}
+        for r in acct.rows:
+            groups.setdefault(r["step"], []).append(r)
+        for step, rows in groups.items():
+            log(f"  [{acct.day}] {step}: {_fmt_totals(_sum_rows(rows))}")
+        log(f"  [{acct.day}] TOTAL: {_fmt_totals(acct.run_totals())}")
+    log("=== total API usage (ledger) ===")
+    by_csv: dict[Path, list[dict]] = {}
+    for acct in accts:
+        rows = ledger_rows(acct.csv_path)
+        if rows or acct.csv_path.exists():
+            by_csv.setdefault(acct.csv_path, []).extend(rows)
+    if not by_csv:
+        log("  (no api-usage.csv written yet -- no API calls were made)")
+    for csv_path, rows in by_csv.items():
+        t = _sum_rows(rows)
+        days = sorted({r.get("day", "") for r in rows if r.get("day")})
+        log(f"  TOTAL {csv_path}: {_fmt_totals(t)}"
+            + (f" across day(s): {', '.join(days)}" if days else ""))
+
+
+def extract_pi_transcript(session_path: Path) -> dict:
+    """Parse a pi session file (JSONL, one entry per line) into a plain-JSON transcript:
+    session metadata, provider/model, the message list (text, thinking, tool calls and
+    tool results; assistant messages carry their usage), standalone usage entries, and
+    summed usage totals (tokens + cost)."""
+    entries = []
+    for line in Path(session_path).read_text().splitlines():
+        line = line.strip()
+        if line:
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    header = next((e for e in entries if e.get("type") == "session"), {})
+    provider = model = None
+    messages: list[dict] = []
+    other_usage: list[dict] = []
+    totals: dict = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+                     "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0,
+                              "cacheWrite": 0.0, "total": 0.0}}
+    for e in entries:
+        etype = e.get("type")
+        if etype == "model_change":
+            provider = e.get("provider", provider)
+            model = e.get("modelId", model)
+        elif etype == "usage":
+            other_usage.append({"kind": e.get("kind"), "provider": e.get("provider"),
+                                "model": e.get("model"), "usage": e.get("usage")})
+        elif etype == "message":
+            m = e.get("message") or {}
+            role = m.get("role")
+            msg: dict = {"role": role, "timestamp": e.get("timestamp")}
+            content = m.get("content")
+            blocks = content if isinstance(content, list) else ([{"type": "text", "text": content}]
+                                                                if isinstance(content, str) else [])
+            texts, thinking, tool_calls = [], [], []
+            for b in blocks:
+                if not isinstance(b, dict):
+                    continue
+                bt = b.get("type")
+                if bt == "text":
+                    texts.append(b.get("text", ""))
+                elif bt == "thinking":
+                    thinking.append(b.get("thinking", ""))
+                elif bt == "toolCall":
+                    tool_calls.append({"id": b.get("id"), "name": b.get("name"),
+                                       "arguments": b.get("arguments")})
+            if texts:
+                msg["text"] = "\n".join(texts)
+            if thinking:
+                msg["thinking"] = "\n".join(thinking)
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+            if role == "toolResult":
+                msg["tool_call_id"] = m.get("toolCallId")
+                msg["tool_name"] = m.get("toolName")
+                msg["is_error"] = bool(m.get("isError"))
+            if role == "assistant":
+                msg["model"] = m.get("model")
+                msg["provider"] = m.get("provider")
+                msg["stop_reason"] = m.get("stopReason")
+                if m.get("errorMessage"):
+                    msg["error"] = m["errorMessage"]
+                u = m.get("usage") or {}
+                msg["usage"] = u
+                for k in ("input", "output", "cacheRead", "cacheWrite", "totalTokens"):
+                    totals[k] += u.get(k) or 0
+                c = u.get("cost") or {}
+                for k in totals["cost"]:
+                    totals["cost"][k] += c.get(k) or 0.0
+                model = model or m.get("model")
+                provider = provider or m.get("provider")
+            messages.append(msg)
+    return {"session_id": header.get("id"), "session_version": header.get("version"),
+            "started": header.get("timestamp"), "cwd": header.get("cwd"),
+            "provider": provider, "model": model,
+            "messages": messages, "other_usage": other_usage, "usage": totals}
 
 
 # --------------------------------------------------------------------------- #
@@ -381,9 +645,10 @@ def extract_audio_chunk(raw_mp4: Path, start: float, dur: float, out: Path) -> N
 
 def transcribe_chunk(mp3: Path, model: str, language: str | None, api_key: str,
                      max_retries: int = 5, retry_base: float = 2.0,
-                     retry_max: float = 120.0, timeout: int = 3600) -> list[dict]:
+                     retry_max: float = 120.0, timeout: int = 3600) -> tuple[list[dict], dict]:
     """POST one audio chunk to /v1/audio/transcriptions, retrying 5xx/429/network
-    errors with exponential backoff + jitter. 4xx (other than 429) is fatal."""
+    errors with exponential backoff + jitter. 4xx (other than 429) is fatal.
+    Returns (segments, usage) -- the API's usage dict (audio seconds + tokens)."""
     data = {"model": model, "timestamp_granularities": "segment", "stream": "false"}
     if language:
         data["language"] = language
@@ -397,12 +662,13 @@ def transcribe_chunk(mp3: Path, model: str, language: str | None, api_key: str,
                                   files=files, data=data, timeout=timeout)
             if r.status_code == 200:
                 body = r.json()
+                usage = body.get("usage") or {}
                 segs = body.get("segments") or []
                 out = [{"start": float(s["start"]), "end": float(s["end"]),
                         "text": s.get("text", ""), "speaker_id": s.get("speaker_id")}
                        for s in segs]
-                log(f"  chunk {mp3.name}: {len(out)} segments, usage={body.get('usage')}")
-                return out
+                log(f"  chunk {mp3.name}: {len(out)} segments, usage={usage}")
+                return out, usage
             last_err = f"HTTP {r.status_code}: {r.text[:500]}"
             if r.status_code < 500 and r.status_code != 429:
                 sys.exit(f"ERROR: transcription failed, not retrying ({last_err})")
@@ -435,11 +701,13 @@ def write_srt(segments: list[dict], path: Path) -> None:
 def step_transcribe(workdir: Path, model: str, language: str | None,
                     chunk_minutes: int, mock_transcript: Path | None,
                     max_retries: int = 5, retry_base: float = 2.0,
-                    retry_max: float = 120.0) -> list[dict]:
+                    retry_max: float = 120.0,
+                    acct: Accounting | None = None) -> list[dict]:
     transcript_json = workdir / "transcript.json"
     if transcript_json.exists():
         log("transcribe: transcript.json exists, skipping")
         return json.loads(transcript_json.read_text())["segments"]
+    total_usage: dict = {}
     if mock_transcript:
         log(f"transcribe: using mock transcript {mock_transcript}")
         segments = json.loads(mock_transcript.read_text())["segments"]
@@ -464,17 +732,29 @@ def step_transcribe(workdir: Path, model: str, language: str | None,
             cache_file = cache_dir / f"chunk-{idx:03d}.json"
             if cache_file.exists():
                 log(f"transcribe: chunk {idx} [{start:.0f}s +{dur:.0f}s] cached -> {cache_file.name}")
-                raw_segs = json.loads(cache_file.read_text())["segments"]
+                payload = json.loads(cache_file.read_text())
+                raw_segs = payload["segments"]
+                # usage of a cached chunk was already recorded in the ledger when the
+                # API call was made; only accumulate it into the transcript totals
+                for k, v in (payload.get("usage") or {}).items():
+                    total_usage[k] = total_usage.get(k, 0) + (v or 0)
             else:
                 chunk = workdir / f"chunk-{idx:03d}.mp3"
                 log(f"transcribe: chunk {idx} [{start:.0f}s +{dur:.0f}s] of {duration:.0f}s")
                 extract_audio_chunk(raw_mp4, start, dur, chunk)
-                raw_segs = transcribe_chunk(chunk, model, language, api_key,
-                                            max_retries=max_retries, retry_base=retry_base,
-                                            retry_max=retry_max)
+                raw_segs, usage = transcribe_chunk(chunk, model, language, api_key,
+                                                   max_retries=max_retries, retry_base=retry_base,
+                                                   retry_max=retry_max)
                 chunk.unlink(missing_ok=True)
+                if acct is not None:
+                    acct.record(step="transcribe", model=model,
+                                detail=f"chunk-{idx:03d} [{start:.0f}s +{dur:.0f}s]",
+                                **transcribe_usage_fields(usage),
+                                cost_usd=transcribe_cost_usd(usage))
+                for k, v in usage.items():
+                    total_usage[k] = total_usage.get(k, 0) + (v or 0)
                 tmp = cache_file.with_suffix(".tmp")
-                tmp.write_text(json.dumps({"model": model, "segments": raw_segs}))
+                tmp.write_text(json.dumps({"model": model, "usage": usage, "segments": raw_segs}))
                 tmp.rename(cache_file)  # atomic: only complete results are cached
             for s in raw_segs:
                 s = dict(s)
@@ -486,12 +766,16 @@ def step_transcribe(workdir: Path, model: str, language: str | None,
                 all_segments.append(s)
         all_segments.sort(key=lambda s: s["start"])
         segments = all_segments
-    (workdir / "transcript.json").write_text(json.dumps(
-        {"model": model, "segments": segments}, indent=2))
+    doc = {"model": model, "segments": segments}
+    if total_usage:
+        doc["usage"] = total_usage
+        doc["cost_usd"] = round(transcribe_cost_usd(total_usage), 6)
+    (workdir / "transcript.json").write_text(json.dumps(doc, indent=2))
     write_srt(segments, workdir / "raw.srt")
     (workdir / "transcript.txt").write_text(
         "\n".join(f"[{srt_ts(s['start'])[:8]}] {s['text'].strip()}" for s in segments))
-    log(f"transcribe: {len(segments)} segments -> transcript.json, raw.srt, transcript.txt")
+    log(f"transcribe: {len(segments)} segments -> transcript.json, raw.srt, transcript.txt"
+        + (f" (usage {total_usage}, cost ${doc['cost_usd']:.4f})" if total_usage else ""))
     return segments
 
 
@@ -610,16 +894,18 @@ def build_segment_prompt(workdir: Path, segments: list[dict],
     if sandboxed:
         sandbox_note = (
             "FILE ACCESS: this directory is mounted READ-ONLY for you (bubblewrap sandbox).\n"
-            "Write ALL scratch files -- frames, packet CSVs, helper scripts, notes -- into the\n"
-            "agent-scratch/ subdirectory only; writes anywhere else will fail. keyframes.json,\n"
-            "segments.json, raw.mp4, raw.srt, transcript.* and segment-prompt.md are\n"
-            "pipeline-owned and protected."
+            "Write ALL scratch files -- frames, packet CSVs, helper scripts, notes, your\n"
+            "session file -- into the agent-scratch/ subdirectory only; writes anywhere else\n"
+            "will fail. keyframes.json, segments.json, raw.mp4, raw.srt, transcript.*,\n"
+            "segment-prompt.md, pi-session.jsonl and pi-transcript.json are pipeline-owned\n"
+            "and protected."
         )
     else:
         sandbox_note = (
             "FILE ACCESS: never create, overwrite or delete pipeline files (keyframes.json,\n"
-            "segments.json, raw.mp4, raw.srt, transcript.*, segment-prompt.md). Write ALL\n"
-            "scratch files (frames, packet CSVs, helper scripts) into agent-scratch/ only."
+            "segments.json, raw.mp4, raw.srt, transcript.*, segment-prompt.md,\n"
+            "pi-session.jsonl, pi-transcript.json). Write ALL scratch files (frames, packet\n"
+            "CSVs, helper scripts, your session file) into agent-scratch/ only."
         )
     # compact transcript: [hh:mm:ss] text
     lines = []
@@ -696,9 +982,48 @@ def bwrap_command(cmd: list[str], workdir: Path) -> list[str]:
             "--"] + cmd
 
 
+def build_pi_oneshot_cmd(pi_bin: str, model: str, effort: str,
+                         prompt_file: Path, session_file: Path) -> list[str]:
+    """pi oneshot command for the segment stage. The session is persisted to
+    `session_file` (instead of --no-session) so the transcript lands in the workdir."""
+    cmd = [pi_bin, "--print", "--session", str(session_file),
+           "--model", model, "--thinking", effort, "@" + str(prompt_file.resolve())]
+    if pi_supports_effort(pi_bin):
+        cmd += ["--effort", effort]
+    if pi_supports_tools(pi_bin):
+        # the segment task only needs read (prompt/frames/keyframes.json) and
+        # bash (ffprobe/ffmpeg/compare); never the write/edit tools
+        cmd += ["--tools", "read,bash"]
+    return cmd
+
+
+def save_pi_transcript(workdir: Path, session_scratch: Path, acct: Accounting | None,
+                       model_fallback: str) -> dict | None:
+    """Copy the pi session file out of agent-scratch into the workdir and extract a
+    plain-JSON transcript next to it; record the run's API usage in the ledger.
+    Returns the extracted transcript (None if pi wrote no session file)."""
+    session_out = workdir / PI_SESSION_NAME
+    if not session_scratch.exists():
+        return None
+    shutil.copyfile(session_scratch, session_out)
+    transcript = extract_pi_transcript(session_out)
+    (workdir / PI_TRANSCRIPT_NAME).write_text(json.dumps(transcript, indent=2))
+    totals = transcript["usage"]
+    cost = totals["cost"]["total"] or estimate_chat_cost_usd(totals)
+    n_req = sum(1 for m in transcript["messages"]
+                if m["role"] == "assistant" and m.get("usage"))
+    if acct is not None:
+        acct.record(step="segment", model=transcript.get("model") or model_fallback,
+                    detail=f"pi oneshot (session {str(transcript.get('session_id'))[:8]})",
+                    requests=max(n_req, 1), **pi_usage_fields(totals), cost_usd=cost)
+    log(f"segment: pi transcript -> {session_out.name} + {PI_TRANSCRIPT_NAME} "
+        f"({n_req} api response(s), {totals['totalTokens']} tokens, ${cost:.4f})")
+    return transcript
+
+
 def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
                  mock_segments: Path | None, day_title: str | None = None,
-                 sandbox: str = "auto") -> dict:
+                 sandbox: str = "auto", acct: Accounting | None = None) -> dict:
     """Segment one video into segments > sections. day_title (config mode only) is
     the day this video belongs to, given by the caller -- passed to the prompt as
     context; the model never guesses days."""
@@ -718,19 +1043,22 @@ def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
         prompt_file = workdir / "segment-prompt.md"
         prompt_file.write_text(prompt)
         log(f"segment: prompt is {len(prompt)} chars -> {prompt_file}")
-        cmd = [pi_bin, "--print", "--no-session", "--model", model,
-               "--thinking", effort, "@" + str(prompt_file.resolve())]
-        if pi_supports_effort(pi_bin):
-            cmd += ["--effort", effort]
-        if pi_supports_tools(pi_bin):
-            # the segment task only needs read (prompt/frames/keyframes.json) and
-            # bash (ffprobe/ffmpeg/compare); never the write/edit tools
-            cmd += ["--tools", "read,bash"]
+        # the session file goes into agent-scratch: inside the bwrap sandbox that is
+        # the only writable place, and pi writes it incrementally (survives a crash);
+        # it is copied to the workdir as pi-session.jsonl right after the run.
+        # Absolute path: pi resolves a relative --session path against its own cwd.
+        scratch = (workdir / "agent-scratch").resolve()
+        scratch.mkdir(exist_ok=True)
+        session_scratch = scratch / PI_SESSION_NAME
+        session_scratch.unlink(missing_ok=True)  # fresh session per attempt
+        (workdir / PI_SESSION_NAME).unlink(missing_ok=True)
+        cmd = build_pi_oneshot_cmd(pi_bin, model, effort, prompt_file, session_scratch)
         if will_sandbox:
             cmd = bwrap_command(cmd, workdir)
         log(f"segment: running pi oneshot{' in bwrap sandbox' if will_sandbox else ''}: "
             f"{' '.join(cmd[:8])} ...")
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir)
+        save_pi_transcript(workdir, session_scratch, acct, model)
         if proc.returncode != 0:
             sys.exit(f"ERROR: pi failed (rc={proc.returncode}):\n{proc.stderr[-3000:]}")
         (workdir / "segment-raw-output.txt").write_text(proc.stdout)
@@ -1169,7 +1497,8 @@ def resolve_options(cli: argparse.Namespace, toml_globals: dict,
     return opt
 
 
-def run_pipeline(opt: dict, source: dict, day_title: str | None) -> None:
+def run_pipeline(opt: dict, source: dict, day_title: str | None,
+                 accts: list[Accounting] | None = None) -> None:
     """Run all stages for one input video. day_title is set in config mode, where the
     video is one pre-cut day and the segment stage must not guess days."""
     url, path = source.get("url"), source.get("path")
@@ -1183,6 +1512,15 @@ def run_pipeline(opt: dict, source: dict, day_title: str | None) -> None:
         workdir = Path(opt["workdir_root"]) / slugify(path.stem)
     workdir.mkdir(parents=True, exist_ok=True)
     log(f"workdir: {workdir.resolve()}" + (f" (day: {day_title})" if day_title else ""))
+
+    # API spend ledger: config mode -> one api-usage.csv at the workdir root (rows are
+    # itemized per day via the day column); single-video mode -> the video's workdir
+    if day_title:
+        acct = Accounting(Path(opt["workdir_root"]) / USAGE_CSV_NAME, day=day_title)
+    else:
+        acct = Accounting(workdir / USAGE_CSV_NAME, day="-")
+    if accts is not None:
+        accts.append(acct)
 
     if not opt["skip_download"]:
         if url:
@@ -1201,14 +1539,14 @@ def run_pipeline(opt: dict, source: dict, day_title: str | None) -> None:
         step_transcribe(workdir, opt["transcribe_model"], opt["language"],
                         opt["chunk_minutes"], opt["mock_transcript"],
                         max_retries=opt["max_retries"], retry_base=opt["retry_base_seconds"],
-                        retry_max=opt["retry_max_seconds"])
+                        retry_max=opt["retry_max_seconds"], acct=acct)
     else:
         log("transcribe: skipped")
 
     if not opt["skip_segment"]:
         data = step_segment(workdir, opt["segment_model"], opt["effort"],
                             opt["pi_bin"], opt["mock_segments"], day_title=day_title,
-                            sandbox=opt["sandbox"])
+                            sandbox=opt["sandbox"], acct=acct)
     else:
         log("segment: skipped")
         data = json.loads((workdir / "segments.json").read_text())
@@ -1225,22 +1563,28 @@ def run_pipeline(opt: dict, source: dict, day_title: str | None) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.config:
-        if args.url:
-            sys.exit("ERROR: pass either a YouTube URL or --config, not both")
-        toml_globals, days = load_config(args.config)
-        if args.workdir is not None:  # in config mode --workdir is the workdir root
-            toml_globals = {**toml_globals, "workdir_root": str(args.workdir)}
-        for i, day in enumerate(days, 1):
-            opt = resolve_options(args, toml_globals, day["overrides"])
-            title = day["title"] or f"Day {i}"
-            log(f"=== day {i}/{len(days)}: {title} ({day['url'] or day['path']}) ===")
-            run_pipeline(opt, day, day_title=title)
-    else:
-        if not args.url:
-            sys.exit("ERROR: a YouTube URL/video ID is required without --config (see --help)")
-        opt = resolve_options(args, {})
-        run_pipeline(opt, {"url": args.url, "workdir": args.workdir}, day_title=None)
+    accts: list[Accounting] = []
+    try:
+        if args.config:
+            if args.url:
+                sys.exit("ERROR: pass either a YouTube URL or --config, not both")
+            toml_globals, days = load_config(args.config)
+            if args.workdir is not None:  # in config mode --workdir is the workdir root
+                toml_globals = {**toml_globals, "workdir_root": str(args.workdir)}
+            for i, day in enumerate(days, 1):
+                opt = resolve_options(args, toml_globals, day["overrides"])
+                title = day["title"] or f"Day {i}"
+                log(f"=== day {i}/{len(days)}: {title} ({day['url'] or day['path']}) ===")
+                run_pipeline(opt, day, day_title=title, accts=accts)
+        else:
+            if not args.url:
+                sys.exit("ERROR: a YouTube URL/video ID is required without --config (see --help)")
+            opt = resolve_options(args, {})
+            run_pipeline(opt, {"url": args.url, "workdir": args.workdir}, day_title=None,
+                         accts=accts)
+    finally:
+        # report the total API usage after any command, even a failed one
+        report_api_usage(accts)
 
 
 if __name__ == "__main__":

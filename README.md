@@ -8,14 +8,19 @@
    **Voxtral-3-small** (`voxtral-small-transcribe-3`), `timestamp_granularities=segment`
    → `transcript.json`, `raw.srt`, `transcript.txt`
 3. **segment** – pipes the timestamped transcript to **`pi` in oneshot mode**
-   (`pi --print --no-session --model mistral/mistral-large-latest --thinking medium`,
-   plus `--effort medium` when the pi build supports it; the literal Mistral-Large-3 id
-   `mistral/mistral-large-2512` can be pinned with `--segment-model`) asking the
-   Mistral-Large model to
+   (`pi --print --session <workdir>/agent-scratch/pi-session.jsonl --model
+   mistral/mistral-large-latest --thinking medium`, plus `--effort medium` when the
+   pi build supports it; the literal Mistral-Large-3 id `mistral/mistral-large-2512`
+   can be pinned with `--segment-model`) asking the Mistral-Large model to
    segment hierarchically into **segments (icebreaker/episode) → sections
    (content/exercise/break)** → intermediate format `segments.json`. Days are never
    guessed: with `--config` each video is one day named by its `[[days]]` entry;
-   a single-video run gets no day level at all.
+   a single-video run gets no day level at all. The pi run **persists its transcript**:
+   `pi-session.jsonl` (pi's native JSONL session — inside the bwrap sandbox it is
+   written to the writable `agent-scratch/` and copied out afterwards; pi appends
+   incrementally, so it survives even a crashed run) and `pi-transcript.json` (a
+   plain-JSON extraction: messages with text/tool calls/tool results, per-message
+   usage, and summed token + cost totals).
    The prompt tells the model to first anchor every boundary to a transcript
    timestamp, then optionally fine-tune it visually: `ffprobe` keyframe listing +
    `ffmpeg` frame extraction, ImageMagick `compare -metric` between frames, and
@@ -45,7 +50,34 @@
 - `chapters.txt`, `sync-report.txt` (per-output subtitle/video drift measured after
   cutting), plus intermediates in the workdir: `transcript.json`, `raw.srt`,
   `segments.json`, `editlist.yaml`, `keyframes.json`, `segment-prompt.md`,
-  `segment-raw-output.txt`
+  `segment-raw-output.txt`, `pi-session.jsonl`, `pi-transcript.json`
+
+## API accounting
+
+Every API request is recorded as one row in an **`api-usage.csv`** ledger, itemized
+per day/step — columns: `timestamp, day, step, detail, model, requests, input_tokens,
+output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, audio_seconds,
+cost_usd`.
+
+- **config mode**: one CSV at the workdir root (`workdir_root/api-usage.csv`, e.g.
+  `pyscicomp2025/api-usage.csv`), rows carry the `day` column.
+- **single-video mode**: the CSV lives in the video's workdir (`work/<id>/api-usage.csv`).
+
+Rows are appended when a request is actually made (cached transcription chunks are
+not re-billed), so re-running a command never double-counts. Transcription usage
+(`usage.prompt_audio_seconds` + tokens) is also cached per chunk in
+`workdir/chunks/chunk-NNN.json` and aggregated into `transcript.json`; the segment
+step's usage/cost is read from `pi-transcript.json`.
+
+Costs: the APIs return usage, not cost, so USD is computed from list prices —
+transcription is billed per audio hour, the pi run uses pi's own catalog-derived cost
+from the session. Override the defaults via env if pricing changes:
+`MISTRAL_TRANSCRIBE_USD_PER_AUDIO_HOUR` (default 0.24), `MISTRAL_USD_PER_1M_INPUT`
+(2.0), `MISTRAL_USD_PER_1M_OUTPUT` (6.0), `MISTRAL_USD_PER_1M_CACHE_READ` (0.2),
+`MISTRAL_USD_PER_1M_CACHE_WRITE` (0.0).
+
+After **any** command (even a failed or fully-cached one) the pipeline prints the API
+usage of the run (per day/step) and the total recorded in the ledger.
 
 ## Run locally
 
