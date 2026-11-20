@@ -861,6 +861,13 @@ def step_transcribe(workdir: Path, model: str, language: str | None,
                 all_segments.append(s)
         all_segments.sort(key=lambda s: s["start"])
         segments = all_segments
+    # Drop degenerate segments (end <= start): the transcription API occasionally
+    # returns zero-duration duplicates, which are invalid SRT cues and make the
+    # srt parser in ffmpeg-editlist log a skip per cue on every edit run.
+    kept = [s for s in segments if float(s["end"]) > float(s["start"])]
+    if len(kept) != len(segments):
+        log(f"transcribe: dropped {len(segments) - len(kept)} degenerate segment(s) with end <= start")
+    segments = kept
     doc = {"model": model, "provider": provider, "segments": segments, "_cache": provenance}
     if total_usage:
         doc["usage"] = total_usage
