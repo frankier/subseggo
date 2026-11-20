@@ -17,6 +17,12 @@ edit stages are all cached/skipped automatically):
   - transcription chunks retry 5xx/429/network errors with exponential backoff
     (--max-retries, --retry-base-seconds, --retry-max-seconds); stages can also be
     skipped explicitly via --skip-download/--skip-transcribe/--skip-segment/--skip-edit.
+  - the segment pi oneshot catches common pi failures and classifies them from the
+    process output + its session transcript: fatal causes (out of API money/402,
+    auth errors, prompt too large, unknown model, bad request) exit immediately with
+    an informative message, anything else (API 5xx, 429, network errors, the run
+    being terminated/killed, unknown random failures) is retried up to 3 total
+    attempts (PI_MAX_ATTEMPTS) before dying with the diagnostics.
   1. download    : yt-dlp grabs the YouTube video as raw.mp4 (+ raw.info.json)
   2. transcribe  : audio chunks -> Mistral /v1/audio/transcriptions (Voxtral-3-small)
                    -> transcript.json (segments) + raw.srt
@@ -28,6 +34,8 @@ edit stages are all cached/skipped automatically):
                    so the user's ~/.pi/agent (settings, extensions, custom models,
                    auth) is never read -- same as inside the Docker image; the API
                    key comes from MISTRAL_API_KEY in the environment
+                   (transient failures are retried up to 3 attempts; fatal ones like
+                   an out-of-balance API exit immediately with an informative error)
                    -> segments.json (intermediate format: segments > sections; days are
                    never guessed -- with --config each video is one day given by the
                    config entry's title, single-video runs get no day level)
@@ -114,6 +122,7 @@ DEFAULT_CHAT_USD_PER_1M = {"input": 2.0, "output": 6.0, "cache_read": 0.2, "cach
 PI_SESSION_NAME = "pi-session.jsonl"      # pi's native session transcript (JSONL) in the workdir
 PI_TRANSCRIPT_NAME = "pi-transcript.json"  # plain-JSON extraction of it (messages + usage totals)
 PI_AGENT_DIR_NAME = "pi-agent"             # bare pi config dir inside agent-scratch (PI_CODING_AGENT_DIR)
+PI_MAX_ATTEMPTS = 3                        # total attempts of the segment pi oneshot before dying
 USAGE_CSV_NAME = "api-usage.csv"
 USAGE_CSV_COLUMNS = ["timestamp", "day", "step", "detail", "model", "requests",
                      "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
@@ -1062,6 +1071,83 @@ def save_pi_transcript(workdir: Path, session_scratch: Path, acct: Accounting | 
     return transcript
 
 
+# Common `pi` oneshot failure causes, matched case-insensitively against the pi
+# process output AND the error messages pi records in its session transcript.
+# Fatal causes (out of money, auth, bad request, ...) are never retried -- the
+# identical request cannot succeed on a retry; everything else is treated as a
+# transient/random failure and retried up to PI_MAX_ATTEMPTS times.
+PI_FATAL_CAUSES = [
+    (r"payment required|insufficient (balance|credits|funds)|out of (credits|money)|"
+     r"credit balance|top[- ]?up your|\b402\b|quota exceeded|billing",
+     "API balance/billing problem -- the Mistral workspace looks out of money/credits"),
+    (r"\b401\b|\b403\b|unauthorized|forbidden|invalid( or missing)? api key|"
+     r"authentication (error|failed)|api key not (valid|found)",
+     "auth problem -- bad or missing MISTRAL_API_KEY"),
+    (r"context length|too many tokens|maximum context|prompt (is )?too long|"
+     r"exceeds the model'?s (context|limit)",
+     "prompt too large for the model"),
+    (r"model (not found|does not exist|doesn'?t exist)|no such model|invalid model|\b404\b",
+     "unknown/invalid model"),
+    (r"\b400\b|\b422\b|bad request|invalid request",
+     "bad request (deterministic -- a retry would send the identical request)"),
+]
+PI_RETRYABLE_CAUSES = [
+    (r"\b429\b|rate ?limit|too many requests|overloaded",
+     "rate limited / overloaded"),
+    (r"\b5\d\d\b|server error|internal (server )?error|bad gateway|service unavailable|"
+     r"gateway timeout|upstream",
+     "API server error (5xx)"),
+    (r"network|econnreset|econnrefused|etimedout|timed? ?out|timeout|fetch failed|"
+     r"socket|dns|eai_again|connection (reset|refused|closed)",
+     "network error"),
+    (r"terminated|aborted|interrupted|killed|sigterm|sigint|broken pipe",
+     "run terminated/aborted (killed or cancelled mid-request)"),
+]
+
+
+def classify_pi_failure(rc: int, diag: str) -> tuple[str, str]:
+    """Classify a failed pi oneshot run -> ("fatal" | "retryable", cause).
+    Unknown causes and a process killed by a signal count as random failures
+    (retryable); the caller gives up after PI_MAX_ATTEMPTS of those."""
+    low = diag.lower()
+    for pat, cause in PI_FATAL_CAUSES:
+        if re.search(pat, low):
+            return "fatal", cause
+    for pat, cause in PI_RETRYABLE_CAUSES:
+        if re.search(pat, low):
+            return "retryable", cause
+    if rc < 0:
+        return "retryable", f"pi process killed by signal {-rc}"
+    return "retryable", "unknown/random failure"
+
+
+def pi_session_errors(transcript: dict | None) -> list[str]:
+    """The distinct errorMessage strings pi recorded in its session (assistant
+    messages carry them, e.g. 'Provider stopped with: error (server error)')."""
+    errs: list[str] = []
+    for m in (transcript or {}).get("messages", []):
+        e = m.get("error")
+        if e and e not in errs:
+            errs.append(e)
+    return errs
+
+
+def pi_failure_diagnostics(proc: subprocess.CompletedProcess,
+                           transcript: dict | None) -> str:
+    """Human-readable excerpt of a failed pi run. The session error messages are the
+    reliable source (on a provider error pi often prints only a terse 'terminated'
+    on stderr); the process output tails are added for anything else."""
+    parts = []
+    errs = pi_session_errors(transcript)
+    if errs:
+        parts.append("pi session error(s): " + " | ".join(errs[-4:]))
+    for name, out in (("stderr", proc.stderr), ("stdout", proc.stdout)):
+        out = (out or "").strip()
+        if out:
+            parts.append(f"{name} tail: {out[-1500:]}")
+    return "\n".join(parts) if parts else "(no output captured)"
+
+
 def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
                  mock_segments: Path | None, day_title: str | None = None,
                  sandbox: str = "auto", acct: Accounting | None = None) -> dict:
@@ -1088,11 +1174,14 @@ def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
         # the only writable place, and pi writes it incrementally (survives a crash);
         # it is copied to the workdir as pi-session.jsonl right after the run.
         # Absolute path: pi resolves a relative --session path against its own cwd.
+        if shutil.which(pi_bin) is None:
+            sys.exit(f"ERROR: pi binary not found: {pi_bin!r} (install pi, or set --pi-bin / PI_BIN)")
+        if not os.environ.get("MISTRAL_API_KEY"):
+            log("segment: WARNING MISTRAL_API_KEY is not set -- the bare-config pi run has no "
+                "Mistral auth (pi falls back to this env var) and will fail with an auth error")
         scratch = (workdir / "agent-scratch").resolve()
         scratch.mkdir(exist_ok=True)
         session_scratch = scratch / PI_SESSION_NAME
-        session_scratch.unlink(missing_ok=True)  # fresh session per attempt
-        (workdir / PI_SESSION_NAME).unlink(missing_ok=True)
         # bare pi config: PI_CODING_AGENT_DIR -> empty dir in agent-scratch, so pi
         # never picks up the user's ~/.pi/agent (sandboxed or not -- inside bwrap
         # the env passes through and the dir is on the writable scratch bind)
@@ -1104,10 +1193,45 @@ def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
         log(f"segment: running pi oneshot{' in bwrap sandbox' if will_sandbox else ''} "
             f"with bare config (PI_CODING_AGENT_DIR={env['PI_CODING_AGENT_DIR']}): "
             f"{' '.join(cmd[:8])} ...")
-        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir, env=env)
-        save_pi_transcript(workdir, session_scratch, acct, model)
-        if proc.returncode != 0:
-            sys.exit(f"ERROR: pi failed (rc={proc.returncode}):\n{proc.stderr[-3000:]}")
+        # Retry loop: common fatal pi problems (out of API money, bad/missing API key,
+        # prompt too large, unknown model, bad request) exit immediately with an
+        # informative message; anything else (API 5xx, 429, network errors, the run
+        # being terminated/killed, unknown random failures) is retried up to
+        # PI_MAX_ATTEMPTS total attempts, then dies with the diagnostics.
+        for attempt in range(1, PI_MAX_ATTEMPTS + 1):
+            session_scratch.unlink(missing_ok=True)  # fresh session per attempt
+            (workdir / PI_SESSION_NAME).unlink(missing_ok=True)
+            if attempt > 1:
+                log(f"segment: pi attempt {attempt}/{PI_MAX_ATTEMPTS}")
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir, env=env)
+            except FileNotFoundError as e:
+                sys.exit(f"ERROR: cannot run pi: {cmd[0]!r} not found/executable ({e}); "
+                         f"install pi or set --pi-bin / PI_BIN")
+            # save the transcript + record the spend even of a failed attempt
+            transcript = save_pi_transcript(workdir, session_scratch, acct, model)
+            if proc.returncode == 0:
+                break
+            diag = pi_failure_diagnostics(proc, transcript)
+            kind, cause = classify_pi_failure(proc.returncode, diag)
+            if kind == "fatal":
+                sys.exit(f"ERROR: pi failed (rc={proc.returncode}) on attempt "
+                         f"{attempt}/{PI_MAX_ATTEMPTS}: {cause} -- NOT retried, a retry "
+                         f"would send the identical request.\n{diag}\n"
+                         f"pi session: {workdir / PI_SESSION_NAME} (spend already in the usage "
+                         f"ledger). Fix the cause -- e.g. top up the Mistral API balance, set "
+                         f"MISTRAL_API_KEY, shrink the prompt, pick an existing model -- and "
+                         f"re-run the same command.")
+            if attempt == PI_MAX_ATTEMPTS:
+                sys.exit(f"ERROR: pi failed after {PI_MAX_ATTEMPTS} attempts "
+                         f"(last: rc={proc.returncode}, {cause}).\n{diag}\n"
+                         f"pi session: {workdir / PI_SESSION_NAME} (spend already in the usage "
+                         f"ledger). Re-run the same command to retry the segment stage -- it "
+                         f"is only cached once it succeeds.")
+            delay = min(120.0, 15.0 * 2 ** (attempt - 1)) + random.uniform(0, 2.0)
+            log(f"segment: pi attempt {attempt}/{PI_MAX_ATTEMPTS} failed "
+                f"({cause}, rc={proc.returncode}); retrying in {delay:.1f}s")
+            time.sleep(delay)
         (workdir / "segment-raw-output.txt").write_text(proc.stdout)
         data = extract_json_block(proc.stdout)
     data = validate_segments(data, duration)

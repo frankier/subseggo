@@ -135,6 +135,27 @@ def make_session_jsonl() -> str:
     return "\n".join(json.dumps(e) for e in entries) + "\n"
 
 
+def make_error_session_jsonl(err: str) -> str:
+    """A synthetic pi session whose last assistant message failed with `err`
+    (stopReason error + errorMessage, as pi records provider failures)."""
+    entries = [
+        {"type": "session", "version": 3, "id": "err-1", "timestamp": "2026-01-01T10:00:00.000Z", "cwd": "/w"},
+        {"type": "model_change", "id": "e1", "parentId": None, "timestamp": "2026-01-01T10:00:01.000Z",
+         "provider": "mistral", "modelId": "mistral-large-2512"},
+        {"type": "message", "id": "e2", "parentId": "e1", "timestamp": "2026-01-01T10:00:02.000Z",
+         "message": {"role": "user", "content": "segment this", "timestamp": 1}},
+        {"type": "message", "id": "e3", "parentId": "e2", "timestamp": "2026-01-01T10:00:10.000Z",
+         "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm"}],
+                     "api": "mistral-conversations", "provider": "mistral", "model": "mistral-large-2512",
+                     "usage": {"input": 100, "output": 5, "cacheRead": 0, "cacheWrite": 0,
+                               "totalTokens": 105,
+                               "cost": {"input": 2e-4, "output": 3e-5, "cacheRead": 0.0,
+                                        "cacheWrite": 0.0, "total": 2.3e-4}},
+                     "stopReason": "error", "errorMessage": err, "timestamp": 2}},
+    ]
+    return "\n".join(json.dumps(e) for e in entries) + "\n"
+
+
 class ExtractPiTranscriptTests(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
@@ -425,6 +446,137 @@ class StepSegmentTranscriptTests(unittest.TestCase):
         self.assertIsNone(pipeline.save_pi_transcript(self.workdir, self.dir / "nope.jsonl",
                                                       self.acct, "m"))
         self.assertEqual(self.acct.rows, [])
+
+
+class ClassifyPiFailureTests(unittest.TestCase):
+    """classify_pi_failure: money/auth/bad-request are fatal, transient and random
+    failures (incl. the 'terminated' of the incident) are retryable."""
+
+    def test_out_of_money_is_fatal(self):
+        for txt in ("HTTP 402: payment required",
+                    "insufficient credits for this workspace",
+                    "your credit balance is too low, top up your account"):
+            kind, cause = pipeline.classify_pi_failure(1, f"stderr tail: {txt}")
+            self.assertEqual(kind, "fatal", txt)
+            self.assertIn("money", cause)
+
+    def test_auth_is_fatal(self):
+        kind, cause = pipeline.classify_pi_failure(1, "401 Unauthorized: invalid api key")
+        self.assertEqual(kind, "fatal")
+        self.assertIn("auth", cause)
+
+    def test_prompt_too_large_is_fatal(self):
+        kind, _ = pipeline.classify_pi_failure(1, "400 bad request: context length exceeded")
+        self.assertEqual(kind, "fatal")
+
+    def test_server_error_is_retryable(self):
+        kind, cause = pipeline.classify_pi_failure(
+            1, "pi session error(s): Provider stopped with: error (server error)")
+        self.assertEqual(kind, "retryable")
+        self.assertIn("5xx", cause)
+
+    def test_terminated_is_retryable(self):
+        # the incident: pi exited rc=1 with only "terminated" on stderr
+        kind, cause = pipeline.classify_pi_failure(1, "stderr tail: terminated")
+        self.assertEqual(kind, "retryable")
+        self.assertIn("terminated", cause)
+
+    def test_429_is_retryable(self):
+        kind, _ = pipeline.classify_pi_failure(1, "HTTP 429: rate limit exceeded")
+        self.assertEqual(kind, "retryable")
+
+    def test_network_error_is_retryable(self):
+        kind, cause = pipeline.classify_pi_failure(1, "fetch failed: ECONNRESET")
+        self.assertEqual(kind, "retryable")
+        self.assertIn("network", cause)
+
+    def test_killed_by_signal_is_retryable(self):
+        kind, cause = pipeline.classify_pi_failure(-15, "")
+        self.assertEqual(kind, "retryable")
+        self.assertIn("signal 15", cause)
+
+    def test_unknown_is_retryable_random_failure(self):
+        self.assertEqual(pipeline.classify_pi_failure(1, "weird stuff"),
+                         ("retryable", "unknown/random failure"))
+
+
+class StepSegmentRetryTests(unittest.TestCase):
+    """step_segment retries a failing pi oneshot up to PI_MAX_ATTEMPTS total attempts,
+    records the spend of every attempt, and dies immediately (no retry) on fatal
+    causes like an out-of-money API."""
+
+    GOOD_OUT = ('```json\n{"segments": [{"kind": "episode", "title": "ep", "start": 0, '
+                '"end": 100, "sections": [{"kind": "content", "title": "c", '
+                '"start": 0, "end": 100}]}]}\n```\n')
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.workdir = self.dir / "work"
+        self.workdir.mkdir()
+        (self.workdir / "raw.info.json").write_text(json.dumps(
+            {"id": "x", "title": "t", "uploader": "u", "description": "", "duration": 100}))
+        (self.workdir / "transcript.json").write_text(json.dumps(
+            {"model": "m", "segments": [{"start": 0.0, "end": 10.0, "text": "hi"}]}))
+        self.acct = pipeline.Accounting(self.dir / "api-usage.csv", day="Day 1")
+
+    def _fake_pi(self, failures: int, err: str, rc: int = 1):
+        """A fake subprocess.run: the first `failures` calls fail (rc, stderr=err,
+        session with errorMessage=err), later calls succeed like the other tests."""
+        state = {"n": 0}
+
+        def fake_run(cmd, **kw):
+            state["n"] += 1
+            i = cmd.index("--session")
+            if state["n"] <= failures:
+                Path(cmd[i + 1]).write_text(make_error_session_jsonl(err))
+                return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
+            Path(cmd[i + 1]).write_text(make_session_jsonl())
+            return subprocess.CompletedProcess(cmd, 0, stdout=self.GOOD_OUT, stderr="")
+        return fake_run, state
+
+    def _run_segment(self, fake_run):
+        with mock.patch.object(pipeline, "probe_duration", return_value=100.0), \
+                mock.patch.object(pipeline, "pi_supports_effort", return_value=False), \
+                mock.patch.object(pipeline, "pi_supports_tools", return_value=False), \
+                mock.patch.object(pipeline.shutil, "which", return_value="/usr/bin/pi"), \
+                mock.patch.object(pipeline.time, "sleep") as slp, \
+                mock.patch.object(pipeline.subprocess, "run", side_effect=fake_run):
+            data = pipeline.step_segment(self.workdir, "m", "medium", "pi", None,
+                                         day_title="Day 1", sandbox="none", acct=self.acct)
+        return data, slp
+
+    def test_transient_failures_retried_then_succeed(self):
+        fake, state = self._fake_pi(2, "Provider stopped with: error (server error)")
+        data, slp = self._run_segment(fake)
+        self.assertEqual(state["n"], 3)          # 2 failures + 1 success = 3 attempts
+        self.assertEqual(slp.call_count, 2)      # backoff slept between attempts
+        self.assertEqual(len(data["segments"]), 1)
+        self.assertTrue((self.workdir / "segments.json").exists())
+        rows = pipeline.ledger_rows(self.dir / "api-usage.csv")
+        self.assertEqual(len(rows), 3)           # spend of every attempt recorded
+        self.assertTrue(all(r["step"] == "segment" for r in rows))
+
+    def test_fatal_out_of_money_dies_immediately_without_retry(self):
+        fake, state = self._fake_pi(99, "HTTP 402: payment required -- insufficient credits")
+        with self.assertRaises(SystemExit) as cm:
+            self._run_segment(fake)
+        self.assertEqual(state["n"], 1)          # fatal: no retry
+        msg = str(cm.exception)
+        self.assertIn("out of money", msg)
+        self.assertIn("NOT retried", msg)
+
+    def test_gives_up_after_max_attempts_with_informative_error(self):
+        fake, state = self._fake_pi(99, "terminated")
+        with self.assertRaises(SystemExit) as cm:
+            self._run_segment(fake)
+        self.assertEqual(state["n"], pipeline.PI_MAX_ATTEMPTS)
+        msg = str(cm.exception)
+        self.assertIn(f"after {pipeline.PI_MAX_ATTEMPTS} attempts", msg)
+        self.assertIn("terminated", msg)         # diagnostics from session + stderr
+        self.assertIn("pi session:", msg)
+        # spend of the failed attempts was still recorded
+        self.assertEqual(len(pipeline.ledger_rows(self.dir / "api-usage.csv")),
+                         pipeline.PI_MAX_ATTEMPTS)
 
 
 class SandboxTests(unittest.TestCase):
