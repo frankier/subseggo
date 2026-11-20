@@ -7,7 +7,7 @@
 # ]
 # ///
 """
-YouTube -> subtitles -> hierarchical segmentation -> editlist -> mp4 outputs.
+YouTube -> subtitles -> hierarchical segmentation -> keyframe cuts -> aligned mp4.
 
 Pipeline stages (resumable: re-run the same command after a failure — finished
 downloads, per-chunk transcription results (workdir/chunks/), segmentation and
@@ -22,8 +22,17 @@ edit stages are all cached/skipped automatically):
     being terminated/killed, unknown random failures) is retried up to 3 total
     attempts (PI_MAX_ATTEMPTS) before dying with the diagnostics.
   1. download    : yt-dlp grabs the YouTube video as raw.mp4 (+ raw.info.json)
-  2. transcribe  : audio chunks -> Mistral Voxtral by default or OpenAI Whisper
-                   -> transcript.json (segments) + raw.srt
+  2. transcribe  : silence-aware audio chunks -> Mistral Voxtral by default or
+                   OpenAI Whisper -> transcript.json (segments) + raw.srt.
+                   Chunks run from the first non-silent sample to the next silence of
+                   at least --chunk-silence-min-seconds (30 by default), so no chunk
+                   contains a long silence: a provider compresses those (a real 347.7 s
+                   silence came back as 77.9 s) and its timestamps then drift by
+                   minutes. Regions still over --chunk-minutes are split into the
+                   fewest equal pieces that fit, overlapping by
+                   --chunk-overlap-seconds. Each chunk's transcript is compared with
+                   its own audio (workdir/transcript-coverage.txt,
+                   --no-transcript-coverage-check) so a drifting provider is reported.
   3. segment     : `pi` oneshot (Mistral Large by default or OpenAI GPT-6.1 Terra,
                    medium effort) over the transcript,
                    run in a bubblewrap read-only sandbox when available (--sandbox;
@@ -38,20 +47,36 @@ edit stages are all cached/skipped automatically):
                    -> segments.json (intermediate format: segments > sections; days are
                    never guessed -- with --config each video is one day given by the
                    config entry's title, single-video runs get no day level)
-  4. edit        : segments.json -> keyframe-aligned cuts -> mp4 + rebased .srt
+  4. edit        : segments.json -> keyframe-exact cuts -> mp4 + rebased .srt
                    -> per-segment mp4 outputs with break sections removed,
                       plus the original mp4 with subtitles applied.
-                   Cut points are snapped to video keyframes (raw.mp4 is probed once,
-                   right after download, cached in workdir/keyframes.json; the cache
-                   is fingerprint-bound to raw.mp4, validated on read and written
-                   atomically, so a stale/corrupt cache is re-probed, not fatal)
-                   so the stream-copied cuts start
-                   exactly where the editlist says -- otherwise each range's video
-                   begins at the next keyframe and the (nominal-time) subtitles drift
-                   against it, accumulating a visible offset at every cut. A sync
-                   report (out/sync-report.txt) verifies per output that the actual
-                   video range starts match the nominal editlist times (--no-snap-keyframes
-                   disables the snapping).
+                   Each range is cut with -c copy from the exact PTS of the nearest
+                   keyframe (raw.mp4 is probed once, right after download, cached in
+                   workdir/keyframes.json; the cache is fingerprint-bound to raw.mp4,
+                   validated on read and written atomically, so a stale/corrupt cache
+                   is re-probed, not fatal). Snapping to the NEAREST keyframe rather
+                   than always forwards avoids losing up to a GOP per cut
+                   (--no-snap-keyframes disables snapping). ffmpeg seeks with -ss as an
+                   INPUT option, which lands on the keyframe at or before the request;
+                   an output-side -ss lands on the NEXT keyframe and loses content. The
+                   parts are joined with the concat demuxer declaring each part's
+                   duration explicitly -- without that it advances by the container
+                   duration (the longer track), so audio creeps ahead of video and of
+                   the .srt at every join. The .srt is rebased from the ranges actually
+                   cut, and a cue broken by a cut is clipped and merged, not emitted
+                   twice. A sync report (out/sync-report.txt) verifies per output that
+                   the video timeline matches the one the .srt was rebased onto.
+  5. align       : post-edit verification and repair. At --align-samples points
+                   (8 by default) the output's loudness envelope is cross-correlated
+                   against raw.mp4 over +/-align-search-seconds (3 by default) to find
+                   where its sound really came from, and a 1 s burst of downscaled
+                   greyscale frames is located the same way for the picture.
+                   Untrustworthy measurements (silence, a static slide where every
+                   offset ties) are rejected, not guessed. The sidecar .srt is shifted
+                   by the interpolated lag, cancelling whatever residual the cut and the
+                   transcript leave, and the measurements go to out/align-report.txt
+                   (--no-align-check disables the pass, --no-align-repair measures
+                   without rewriting the .srt).
 
 Transcripts & API accounting:
   - the pi oneshot of stage 3 runs with --session, so pi's transcript is persisted:

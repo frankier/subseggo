@@ -11,6 +11,9 @@
 # win over both. Keys use the CLI flag names with underscores, e.g.:
 #   height, language, transcribe_provider, segment_provider, transcribe_model,
 #   segment_model, effort, chunk_minutes,
+#   chunk_silence_min_seconds, chunk_overlap_seconds,
+#   silence_dbfs, silence_min_seconds, transcript_coverage_check,
+#   align_check, align_samples, align_search_seconds, align_repair,
 #   subs ("embed"|"burn"|"sidecar"), reencode, no_combined, pi_bin,
 #   skip_download, skip_transcribe, skip_segment, skip_edit, force_edit,
 #   no_snap_keyframes, sandbox ("auto"|"bwrap"|"none"), max_retries,
@@ -21,6 +24,28 @@ workdir_root = "work"   # per-day workdirs are created under this dir
 height = 1080
 language = "en"
 subs = "embed"
+
+# --- transcription chunking -------------------------------------------------
+# Chunks are cut at silences, never through them: a provider compresses a long
+# silence (a real 347.7 s one came back as 77.9 s) and its timestamps then drift
+# by minutes. Audio below silence_dbfs counts as silence; a chunk ends at the next
+# silence of at least chunk_silence_min_seconds and the silence is not uploaded.
+# A speech region still longer than chunk_minutes is split into the fewest equal
+# pieces that fit, overlapping by chunk_overlap_seconds.
+chunk_minutes = 55
+# chunk_silence_min_seconds = 30.0
+# chunk_overlap_seconds = 60.0
+# silence_dbfs = -60.0            # loudness below which audio is silence
+# silence_min_seconds = 0.5       # shortest silence the analysis reports
+# transcript_coverage_check = true   # compare each chunk's cues with its own audio
+
+# --- post-edit alignment ----------------------------------------------------
+# Measure each output against raw.mp4 at align_samples points across
+# +/-align_search_seconds, then shift the .srt by the interpolated lag.
+align_check = true
+# align_samples = 8
+# align_search_seconds = 3.0
+# align_repair = true             # false: measure but leave the .srt untouched
 
 # Select the providers independently. Both default to "mistral".
 # transcribe_provider = "mistral"

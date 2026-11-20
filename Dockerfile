@@ -1,5 +1,5 @@
 # YouTube -> Voxtral subtitles -> pi/Mistral-Large-3 hierarchical segmentation
-# -> ffmpeg-editlist -> mp4 outputs.
+# -> keyframe-exact cuts -> aligned subtitles -> mp4 outputs.
 #
 # Base: Debian slim (bookworm). Node.js 22 is installed from the official
 # tarball because pi requires Node >= 22.19 and yt-dlp can use node as its

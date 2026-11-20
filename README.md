@@ -1,10 +1,19 @@
-# YouTube → subtitles → hierarchical segmentation → editlist pipeline
+# YouTube → subtitles → hierarchical segmentation → cut videos with aligned subtitles
 
 `pipeline.py` is a PEP 723 script (`uv run --script`) that:
 
 1. **download** – grabs a YouTube video with `yt-dlp` → `work/<video_id>/raw.mp4`
-2. **transcribe** – chunks the audio (55 minutes by default) and sends each chunk
-   to the selected provider's `POST /v1/audio/transcriptions` endpoint. The
+2. **transcribe** – cuts the audio into chunks and sends each one to the selected
+   provider's `POST /v1/audio/transcriptions` endpoint. The chunk boundaries come
+   from the audio itself: `silencedetect` finds every stretch below
+   `--silence-dbfs` (default −60), each chunk runs from the first non-silent sample
+   to the next silence of at least `--chunk-silence-min-seconds` (default 30 s), and
+   a speech region still longer than `--chunk-minutes` (55) is split into the
+   fewest equal pieces that fit, overlapping by `--chunk-overlap-seconds`
+   (default 60 s). Silences are never uploaded — 42 % of a typical conference day —
+   and no chunk contains one, which is the point (see *Why the chunk boundaries
+   follow silence*). Each chunk's transcript is then checked against its own audio
+   (`transcript-coverage.txt`; `--no-transcript-coverage-check` disables). The
    default is **Voxtral-3-small** (`voxtral-small-transcribe-3`) with segment timestamps
    → `transcript.json`, `raw.srt`, `transcript.txt`
 3. **segment** – pipes the timestamped transcript to **`pi` in oneshot mode**
@@ -33,17 +42,61 @@
    the beginning of a segment (a mid-GOP start would make the stream-copied cut
    begin at the *next* keyframe, dropping the segment start), and **forwards** to
    the next keyframe at the end of one so the tail is not cut off mid-GOP.
-4. **edit** – converts `segments.json` to an `editlist.yaml` for
-   [`ffmpeg-editlist`](https://pypi.org/project/ffmpeg-editlist/) and runs it with
-   `--srt --no-mkv-props`, then muxes the cut `.srt` into each `.mp4` as `mov_text`.
-   Because the cuts are stream-copied, each cut actually starts at the first video
-   keyframe with `dts >= start` (probed once from `raw.mp4`, cached in
-   `workdir/keyframes.json`), so editlist start times are snapped to those keyframes
-   first — otherwise the video timeline gets a hole at every cut point and the
-   nominal-time subtitles drift against it (up to a GOP per cut, accumulating in
-   multi-range outputs). After cutting, a sync report (`out/sync-report.txt`)
-   verifies per output that actual video range starts match the nominal editlist
-   times. Disable snapping with `--no-snap-keyframes`.
+4. **edit** – cuts each output's non-`break` section ranges straight out of
+   `raw.mp4` with `-c copy`, rebases `raw.srt` onto the resulting timeline, and then
+   muxes/burns the subtitle (`subs-` prefix when embedded). The cutting is done here
+   rather than by a tool, because every detail of the timeline has to be controlled:
+   - each range starts at the **exact PTS** of the nearest video keyframe (`--no-snap-keyframes`
+     disables that). A stream copy can only begin on a keyframe, so a boundary that
+     is not one has to move; snapping to the *nearest* keyframe rather than always
+     forwards avoids the silent loss of up to a GOP of content per cut, and any move
+     over 2 s is logged.
+   - ffmpeg seeks with `-ss` as an **input** option, which lands on the keyframe at or
+     before the requested time. An output-side `-ss` (what ffmpeg-editlist used) drops
+     packets until the *next* keyframe and so loses content instead.
+   - the parts are joined with the concat demuxer **declaring each part's duration
+     explicitly**. Without that it advances by each part's container duration — the
+     longer of its two tracks — so audio creeps ahead of video and of the .srt at
+     every join (55 ms per join, unbounded in the number of cuts).
+   - the `.srt` is rebased from the ranges *actually cut*, and a cue broken by a cut
+     is clipped and merged back rather than emitted twice.
+   `--reencode` re-encodes instead, which seeks frame-accurately and needs no
+   keyframes at all.
+5. **align** – measures the result and repairs it. At `--align-samples` points
+   (default 8) it finds where the output's sound really came from by
+   cross-correlating its loudness envelope against `raw.mp4` across
+   `±--align-search-seconds` (default 3 s), and independently locates a 1 s burst of
+   downscaled greyscale frames to do the same for the picture. Measurements that
+   cannot be trusted (silence, or a static slide where every offset ties) are
+   rejected rather than guessed. The sidecar `.srt` is then shifted by the
+   interpolated lag, so whatever residual the cut and the transcript leave is
+   cancelled and reported (`out/align-report.txt`) instead of shipped. Disable with
+   `--no-align-check`, or measure without rewriting the `.srt` with `--no-align-repair`.
+
+## Why the chunk boundaries follow silence
+
+The subtitles were once badly out of sync, and the cut/mux/`.srt` stage was not the
+cause: measured on a rebuilt output, audio, video and `.srt` agreed within 30 ms.
+The transcription was. A provider's segment timestamps are produced per chunk, so
+its idea of how quickly time passes inside a chunk is the only thing that can put
+cues minutes away from the speech they belong to — and a long silence inside a
+chunk is where that estimate goes wrong. On one day of a three-day event:
+
+| chunk | real silence | what the provider emitted | effect on that chunk's cues |
+| --- | --- | --- | --- |
+| 3 | 347.7 s | 77.9 s | +92 s before it, −180 s after |
+| 4 | 714 s | 925 s | +211 s, and a 484.6 s silence shrank to 36.9 s |
+
+Chunk 4 also degenerated into a repetition loop around 16190–16700 s: 910 cues
+carrying 56 distinct texts. Nothing downstream can repair that, because the error
+is not a shift but a locally varying warp.
+
+The silences themselves are real — 42–54 % of each day is constant-`-91 dBFS`
+audio — so they are worth avoiding rather than tolerating: no chunk contains one,
+none is uploaded (42 % less audio), and each chunk's transcript is checked against
+its own audio afterwards so that a provider which still drifts is reported instead
+of quietly shipped. The post-edit alignment pass then measures what actually
+landed and cancels the residual.
 
 ## Outputs (in `work/<video_id>/out/`)
 
@@ -51,10 +104,13 @@
 - `<NN>-<segment>.mp4` – one file per segment (icebreaker/episode),
   **break sections removed**, subtitles applied (`subs-` prefix when embedded)
 - `full-nobreaks.mp4` – the whole video with all breaks removed (disable with `--no-combined`)
-- `chapters.txt`, `sync-report.txt` (per-output subtitle/video drift measured after
-  cutting), plus intermediates in the workdir: `transcript.json`, `raw.srt`,
-  `segments.json`, `editlist.yaml`, `keyframes.json`, `segment-prompt.md`,
-  `segment-raw-output.txt`, `pi-session.jsonl`, `pi-transcript.json`
+- `chapters.txt`, `sync-report.txt` (structural: does each output's video timeline
+  match the timeline its `.srt` was rebased onto, plus the measured alignment),
+  `align-report.txt` (per output, the lag measured at every sample point), plus
+  intermediates in the workdir: `transcript.json`, `raw.srt`,
+  `transcript-coverage.txt`, `segments.json`, `keyframes.json`, `silences.json`,
+  `segment-prompt.md`, `segment-raw-output.txt`, `pi-session.jsonl`,
+  `pi-transcript.json`
 
 ## API accounting
 
@@ -125,14 +181,18 @@ keys set global options, `[[days]]` entries may override them per day, and
 explicit CLI flags win over both (resolution: CLI > per-day TOML > global TOML >
 built-in default).
 
-Requirements on PATH: `uv`, `ffmpeg`, `ffprobe`, ImageMagick (`compare`, used when the
-segment model fine-tunes cut points visually), `pi`, `node` (yt-dlp JS runtime).
+Requirements on PATH: `uv`, `ffmpeg`, `ffprobe`, ImageMagick (`compare`, used only by
+the *segment* model when it fine-tunes cut points visually), `pi`, `node` (yt-dlp JS
+runtime). No ffmpeg-editlist: the edit stage cuts the video itself.
 Options: `--language en`, `--subs embed|burn|sidecar`, `--reencode`,
 `--transcribe-provider`, `--segment-provider`,
 `--transcribe-model`, `--segment-model`, `--effort`, `--chunk-minutes`,
+`--chunk-silence-min-seconds`, `--chunk-overlap-seconds`, `--silence-dbfs`,
+`--silence-min-seconds`, `--no-transcript-coverage-check`,
 `--skip-download/--skip-transcribe/--skip-segment/--skip-edit`, `--force-edit`,
-`--no-snap-keyframes`, `--sandbox auto|bwrap|none`, `--mock-transcript`,
-`--mock-segments` (offline testing).
+`--no-snap-keyframes`, `--align-samples`, `--align-search-seconds`,
+`--no-align-check`, `--no-align-repair`, `--sandbox auto|bwrap|none`,
+`--mock-transcript`, `--mock-segments` (offline testing).
 See `--help`.
 
 ## Providers
@@ -177,7 +237,8 @@ support segment timestamps in `verbose_json`.
 OpenAI transcription uses Whisper's timestamped response as a temporary bridge
 until its [scheduled shutdown on February 26, 2027](https://developers.openai.com/api/docs/guides/speech-to-text#timestamps).
 OpenAI audio uploads must be under 25 MB. The default 55-minute MP3 chunks fit
-under this limit. Set a smaller `chunk_minutes` if needed.
+under this limit, and the silence-aware chunking above only makes them shorter.
+Set a smaller `chunk_minutes` if needed.
 
 ## Retries and resuming a partial run
 
@@ -186,7 +247,8 @@ under this limit. Set a smaller `chunk_minutes` if needed.
   --retry-max-seconds 120` (2s, 4s, 8s, … capped at 120s). Other 4xx errors are
   fatal immediately.
 - Every finished chunk's API result is cached atomically in
-  `workdir/chunks/chunk-NNN.json`. If a run dies (e.g. a persistent 520 on the last
+  `workdir/chunks/chunk-NNN.json`, tagged with a fingerprint of the chunking that
+  produced it (offsets, silences, settings). If a run dies (e.g. a persistent 520 on the last
   chunk), just **re-run the same command**: finished chunks are loaded from cache
   and only the missing ones are re-requested. Same for the other stages:
   `raw.mp4`, `transcript.json`, `segments.json` and the `.edit-done` marker make
@@ -238,8 +300,9 @@ docker run --rm \
 
 With rootless podman on an SELinux system the bind mount needs a relabel
 (`-v "$PWD/work:/work/work:Z"`); otherwise the container cannot write into it.
-The pipeline was tested end-to-end in this image (download → Voxtral
-transcription → pi segmentation → editlist → mp4 + mov_text outputs).
+The pipeline was tested end-to-end in this image (download → silence-aware
+chunking → Voxtral transcription → pi segmentation → keyframe cutting → alignment
+→ mp4 + mov_text outputs).
 
 The image is `debian:bookworm-slim` + ffmpeg + ImageMagick + Node 22 (official
 tarball; pi needs ≥ 22.19, yt-dlp uses it as JS runtime) + `uv` + `pi`
@@ -267,7 +330,7 @@ tarball; pi needs ≥ 22.19, yt-dlp uses it as JS runtime) + `uv` + `pi`
 ```
 
 All times are seconds in the original video; sections partition their segment.
-`build_editlist_yaml()` converts this to ffmpeg-editlist YAML: one output per
-segment, editlist = the non-`break` section ranges (start/stop pairs in
-`HH:MM:SS.mmm`, start times snapped to keyframes when available), plus an optional
-combined output.
+`build_output_ranges()` turns this into one output per segment, each being the
+list of that segment's non-`break` section ranges, and `render_ranges()` cuts them
+out of `raw.mp4` and rebases `raw.srt` onto the result; `--no-combined` drops the
+extra output that concatenates the episodes.
