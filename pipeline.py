@@ -2486,9 +2486,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--force-edit", action="store_true", default=None,
                     help="redo the edit stage even if the .edit-done marker exists")
     ap.add_argument("--no-snap-keyframes", action="store_true", default=None,
-                    help="do not snap editlist cut points to video keyframes (stream-copied cuts "
-                         "then start at the next keyframe and subtitles drift; the sync report "
-                         "in out/sync-report.txt is still written)")
+                    help="do not snap cut points to video keyframes (stream-copied cuts then "
+                         "start at the next keyframe and subtitles drift; the sync report in "
+                         "out/sync-report.txt is still written)")
     ap.add_argument("--sandbox", choices=["auto", "bwrap", "none"], default=None,
                     help="sandbox the pi segment agent in a bubblewrap read-only mount: the "
                          "workdir is read-only except workdir/agent-scratch/ (default: auto = "
