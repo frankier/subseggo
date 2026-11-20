@@ -1089,6 +1089,32 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--") + 1:], ["pi", "-p", "hi"])  # cmd intact
         self.assertTrue((self.dir / "agent-scratch").is_dir())
 
+class SkipStageTests(unittest.TestCase):
+    """--skip-* must not demand the artefacts of the stages they skip."""
+
+    def _run(self, work: Path, *flags):
+        opt = pipeline.resolve_options(pipeline.parse_args(list(flags)), {})
+        opt["workdir_root"] = str(work)
+        with mock.patch.object(pipeline, "ensure_keyframe_cache"), \
+                mock.patch.object(pipeline, "step_edit") as edit:
+            pipeline.run_pipeline(opt, {"url": "https://youtu.be/aaaaaaaaaaa",
+                                        "workdir": str(work)}, day_title=None)
+        return edit
+
+    def test_skip_edit_does_not_require_segments_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            edit = self._run(work, "--skip-download", "--skip-transcribe",
+                             "--skip-segment", "--skip-edit")
+            edit.assert_not_called()
+
+    def test_missing_segments_json_is_a_clear_error_when_editing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            with self.assertRaises(SystemExit) as ctx:
+                self._run(work, "--skip-download", "--skip-transcribe", "--skip-segment")
+            self.assertIn("segments.json", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

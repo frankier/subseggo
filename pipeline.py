@@ -2725,7 +2725,13 @@ def run_pipeline(opt: dict, source: dict, day_title: str | None,
                             sandbox=opt["sandbox"], acct=acct, provider=opt["segment_provider"])
     else:
         log("segment: skipped")
-        data = json.loads((workdir / "segments.json").read_text())
+        data = None
+        if not opt["skip_edit"]:
+            seg_path = workdir / "segments.json"
+            if not seg_path.exists():
+                sys.exit(f"ERROR: {seg_path} is missing, but the edit stage needs it "
+                         f"(run without --skip-segment, or add --skip-edit)")
+            data = json.loads(seg_path.read_text())
 
     if opt["skip_edit"]:
         log("edit: skipped (--skip-edit)")
