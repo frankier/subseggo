@@ -9,7 +9,8 @@
 # Any pipeline option can be set globally at the top level of this file and/or
 # per [[days]] entry (per-day keys win over global ones). Explicit CLI flags
 # win over both. Keys use the CLI flag names with underscores, e.g.:
-#   height, language, transcribe_model, segment_model, effort, chunk_minutes,
+#   height, language, transcribe_provider, segment_provider, transcribe_model,
+#   segment_model, effort, chunk_minutes,
 #   subs ("embed"|"burn"|"sidecar"), reencode, no_combined, pi_bin,
 #   skip_download, skip_transcribe, skip_segment, skip_edit, force_edit,
 #   no_snap_keyframes, sandbox ("auto"|"bwrap"|"none"), max_retries,
@@ -20,6 +21,22 @@ workdir_root = "work"   # per-day workdirs are created under this dir
 height = 1080
 language = "en"
 subs = "embed"
+
+# Select the providers independently. Both default to "mistral".
+# transcribe_provider = "mistral"
+# segment_provider = "openai"
+
+# Optional model and effort settings for the selected provider:
+# [providers.mistral.transcribe]
+# model = "voxtral-small-transcribe-3"
+# [providers.mistral.segment]
+# model = "mistral/mistral-large-latest"
+# effort = "medium"
+# [providers.openai.transcribe]
+# model = "whisper-1"                   # timestamped API shuts down 2027-02-26
+# [providers.openai.segment]
+# model = "gpt-6.1-terra"
+# effort = "medium"
 
 [[days]]
 url = "https://www.youtube.com/watch?v=DAY1_VIDEO_ID"   # YouTube URL or 11-char ID

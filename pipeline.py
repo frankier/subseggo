@@ -24,16 +24,17 @@ edit stages are all cached/skipped automatically):
     being terminated/killed, unknown random failures) is retried up to 3 total
     attempts (PI_MAX_ATTEMPTS) before dying with the diagnostics.
   1. download    : yt-dlp grabs the YouTube video as raw.mp4 (+ raw.info.json)
-  2. transcribe  : audio chunks -> Mistral /v1/audio/transcriptions (Voxtral-3-small)
+  2. transcribe  : audio chunks -> Mistral Voxtral by default or OpenAI Whisper
                    -> transcript.json (segments) + raw.srt
-  3. segment     : `pi` oneshot (Mistral-Large-3, medium effort) over the transcript,
+  3. segment     : `pi` oneshot (Mistral Large by default or OpenAI GPT-6.1 Terra,
+                   medium effort) over the transcript,
                    run in a bubblewrap read-only sandbox when available (--sandbox;
                    the workdir is read-only except agent-scratch/, so the agent cannot
                    clobber pipeline files). pi always runs with a BARE config:
                    PI_CODING_AGENT_DIR points at a fresh empty dir in agent-scratch,
                    so the user's ~/.pi/agent (settings, extensions, custom models,
                    auth) is never read -- same as inside the Docker image; the API
-                   key comes from MISTRAL_API_KEY in the environment
+                   key comes from MISTRAL_API_KEY or OPENAI_API_KEY
                    (transient failures are retried up to 3 attempts; fatal ones like
                    an out-of-balance API exit immediately with an informative error)
                    -> segments.json (intermediate format: segments > sections; days are
@@ -83,9 +84,7 @@ See config.example.toml.
 
 Requires on PATH: ffmpeg, ffprobe, pi, imagemagick (compare; lets the segment model
 fine-tune cut points visually) (and node as yt-dlp JS runtime, optional).
-Requires env: MISTRAL_API_KEY (transcription API and, because the segment pi runs
-with a bare config dir, pi's mistral auth too -- pi falls back to this env var,
-exactly as in the Docker image).
+Requires env: MISTRAL_API_KEY and/or OPENAI_API_KEY for the providers in use.
 """
 
 from __future__ import annotations
@@ -107,10 +106,25 @@ import requests
 import yaml
 
 MISTRAL_API_BASE = os.environ.get("MISTRAL_API_BASE", "https://api.mistral.ai/v1")
+OPENAI_API_BASE = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 DEFAULT_TRANSCRIBE_MODEL = "voxtral-small-transcribe-3"   # Voxtral Small Transcribe 3 ("Voxtral-3-small")
 DEFAULT_SEGMENT_MODEL = "mistral/mistral-large-latest"     # Mistral Large line (Large 3 = mistral-large-2512; pin via --segment-model)
 DEFAULT_EFFORT = "medium"
 API_MAX_CHUNK_MINUTES = 55  # API limit is 60 min / 500 MB per request; stay under
+OPENAI_AUDIO_MAX_BYTES = 25_000_000
+OPENAI_TRANSCRIBE_MODEL = "whisper-1"
+OPENAI_SEGMENT_MODEL = "openai/gpt-6.1-terra"
+PROVIDER_API_KEYS = {"mistral": "MISTRAL_API_KEY", "openai": "OPENAI_API_KEY"}
+PROVIDER_DEFAULTS = {
+    "mistral": {
+        "transcribe": {"model": DEFAULT_TRANSCRIBE_MODEL},
+        "segment": {"model": DEFAULT_SEGMENT_MODEL, "effort": DEFAULT_EFFORT},
+    },
+    "openai": {
+        "transcribe": {"model": OPENAI_TRANSCRIBE_MODEL},
+        "segment": {"model": OPENAI_SEGMENT_MODEL, "effort": DEFAULT_EFFORT},
+    },
+}
 
 # List prices used to turn API usage into USD (the APIs return usage, not cost).
 # pi reports its own catalog-derived cost in the session transcript; these are the
@@ -156,8 +170,15 @@ def chat_price_per_1m(kind: str) -> float:
                                 DEFAULT_CHAT_USD_PER_1M[kind]))
 
 
-def transcribe_usage_fields(usage: dict) -> dict:
-    """Mistral /v1/audio/transcriptions usage -> accounting fields."""
+def transcribe_usage_fields(usage: dict, provider: str = "mistral") -> dict:
+    """Map provider transcription usage to the ledger's counters."""
+    if provider == "openai":
+        return {
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+            "audio_seconds": float(usage.get("seconds") or 0),
+        }
     return {
         "input_tokens": int(usage.get("prompt_tokens") or 0),
         "output_tokens": int(usage.get("completion_tokens") or 0),
@@ -177,9 +198,11 @@ def accumulate_usage(total: dict, usage: dict | None) -> None:
         total[k] = total.get(k, 0) + v
 
 
-def transcribe_cost_usd(usage: dict) -> float:
-    """Cost of one transcription request. Mistral bills transcription per audio hour
-    (usage.prompt_audio_seconds); fall back to token pricing if absent."""
+def transcribe_cost_usd(usage: dict, provider: str = "mistral") -> float:
+    """Estimate transcription cost from audio duration, with a Mistral token fallback."""
+    if provider == "openai":
+        per_hour = float(os.environ.get("OPENAI_TRANSCRIBE_USD_PER_AUDIO_HOUR", "0.36"))
+        return float(usage.get("seconds") or 0) / 3600.0 * per_hour
     per_hour = float(os.environ.get("MISTRAL_TRANSCRIBE_USD_PER_AUDIO_HOUR",
                                     DEFAULT_TRANSCRIBE_USD_PER_AUDIO_HOUR))
     secs = usage.get("prompt_audio_seconds")
@@ -189,9 +212,18 @@ def transcribe_cost_usd(usage: dict) -> float:
             + (usage.get("completion_tokens") or 0) * chat_price_per_1m("output")) / 1e6
 
 
-def estimate_chat_cost_usd(totals: dict) -> float:
+def estimate_chat_cost_usd(totals: dict, provider: str = "mistral",
+                           model: str = DEFAULT_SEGMENT_MODEL) -> float:
     """Fallback USD cost of pi usage totals (pi usually reports cost itself in the
     session; this is for sessions without it)."""
+    if provider == "openai":
+        if model.removeprefix("openai/") != "gpt-6.1-terra":
+            return 0.0  # other models use the cost reported by pi
+        return (totals.get("input", 0) + totals.get("output", 0) * 5
+                + totals.get("cacheRead", 0) * 0.05
+                + totals.get("cacheWrite", 0) * 1.25) / 1e6
+    if provider != "mistral":
+        return 0.0
     return (totals.get("input", 0) * chat_price_per_1m("input")
             + totals.get("output", 0) * chat_price_per_1m("output")
             + totals.get("cacheRead", 0) * chat_price_per_1m("cache_read")
@@ -295,10 +327,9 @@ def report_api_usage(accts: list["Accounting"]) -> None:
         log(f"  [{acct.day}] TOTAL: {_fmt_totals(acct.run_totals())}")
     log("=== total API usage (ledger) ===")
     by_csv: dict[Path, list[dict]] = {}
-    for acct in accts:
-        rows = ledger_rows(acct.csv_path)
-        if rows or acct.csv_path.exists():
-            by_csv.setdefault(acct.csv_path, []).extend(rows)
+    for csv_path in dict.fromkeys(acct.csv_path for acct in accts):
+        if csv_path.exists():
+            by_csv[csv_path] = ledger_rows(csv_path)
     if not by_csv:
         log("  (no api-usage.csv written yet -- no API calls were made)")
     for csv_path, rows in by_csv.items():
@@ -672,11 +703,21 @@ def extract_audio_chunk(raw_mp4: Path, start: float, dur: float, out: Path) -> N
 
 def transcribe_chunk(mp3: Path, model: str, language: str | None, api_key: str,
                      max_retries: int = 5, retry_base: float = 2.0,
-                     retry_max: float = 120.0, timeout: int = 3600) -> tuple[list[dict], dict]:
+                     retry_max: float = 120.0, timeout: int = 3600, *,
+                     provider: str = "mistral") -> tuple[list[dict], dict]:
     """POST one audio chunk to /v1/audio/transcriptions, retrying 5xx/429/network
     errors with exponential backoff + jitter. 4xx (other than 429) is fatal.
     Returns (segments, usage) -- the API's usage dict (audio seconds + tokens)."""
-    data = {"model": model, "timestamp_granularities": "segment", "stream": "false"}
+    if provider == "openai":
+        if mp3.stat().st_size >= OPENAI_AUDIO_MAX_BYTES:
+            sys.exit(f"ERROR: OpenAI audio upload {mp3.name} must be under 25 MB. "
+                     "Reduce chunk_minutes or --chunk-minutes.")
+        api_base = OPENAI_API_BASE
+        data = {"model": model, "response_format": "verbose_json",
+                "timestamp_granularities[]": "segment"}
+    else:
+        api_base = MISTRAL_API_BASE
+        data = {"model": model, "timestamp_granularities": "segment", "stream": "false"}
     if language:
         data["language"] = language
     last_err = ""
@@ -684,12 +725,17 @@ def transcribe_chunk(mp3: Path, model: str, language: str | None, api_key: str,
         try:
             with open(mp3, "rb") as fh:
                 files = {"file": (mp3.name, fh, "audio/mpeg")}
-                r = requests.post(f"{MISTRAL_API_BASE}/audio/transcriptions",
+                r = requests.post(f"{api_base}/audio/transcriptions",
                                   headers={"Authorization": f"Bearer {api_key}"},
                                   files=files, data=data, timeout=timeout)
             if r.status_code == 200:
                 body = r.json()
                 usage = body.get("usage") or {}
+                if provider == "openai":
+                    if not isinstance(body.get("segments"), list):
+                        sys.exit(f"ERROR: OpenAI model {model!r} did not return timestamped segments.")
+                    if not usage.get("seconds") and body.get("duration"):
+                        usage["seconds"] = body["duration"]
                 segs = body.get("segments") or []
                 out = [{"start": float(s["start"]), "end": float(s["end"]),
                         "text": s.get("text", ""), "speaker_id": s.get("speaker_id")}
@@ -725,24 +771,42 @@ def write_srt(segments: list[dict], path: Path) -> None:
     path.write_text("\n".join(lines))
 
 
+def write_stage_json(path: Path, data: dict) -> None:
+    """Publish a completed stage or chunk only after its JSON is written."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
 def step_transcribe(workdir: Path, model: str, language: str | None,
                     chunk_minutes: int, mock_transcript: Path | None,
                     max_retries: int = 5, retry_base: float = 2.0,
                     retry_max: float = 120.0,
-                    acct: Accounting | None = None) -> list[dict]:
+                    acct: Accounting | None = None, *,
+                    provider: str = "mistral") -> list[dict]:
     transcript_json = workdir / "transcript.json"
+    raw_mp4 = workdir / "raw.mp4"
+    source = mock_transcript if mock_transcript else raw_mp4
+    provenance = {"provider": provider, "model": model, "language": language,
+                  "chunk_minutes": chunk_minutes, "mock": bool(mock_transcript),
+                  "source": file_fingerprint(source) if source.exists() else None}
+    legacy_mistral = provider == "mistral" and not mock_transcript
     if transcript_json.exists():
-        log("transcribe: transcript.json exists, skipping")
-        return json.loads(transcript_json.read_text())["segments"]
+        cached = json.loads(transcript_json.read_text())
+        if cached.get("_cache") == provenance or (
+                "_cache" not in cached and legacy_mistral and cached.get("model") == model):
+            log("transcribe: transcript.json matches, skipping")
+            return cached["segments"]
+        log("transcribe: transcript.json was produced with different settings")
     total_usage: dict = {}
     if mock_transcript:
         log(f"transcribe: using mock transcript {mock_transcript}")
         segments = json.loads(mock_transcript.read_text())["segments"]
     else:
-        api_key = os.environ.get("MISTRAL_API_KEY")
+        api_key_env = PROVIDER_API_KEYS[provider]
+        api_key = os.environ.get(api_key_env)
         if not api_key:
-            sys.exit("ERROR: MISTRAL_API_KEY is not set (needed for /v1/audio/transcriptions)")
-        raw_mp4 = workdir / "raw.mp4"
+            sys.exit(f"ERROR: {api_key_env} is not set (needed for /v1/audio/transcriptions)")
         duration = probe_duration(raw_mp4)
         chunk_seconds = chunk_minutes * 60
         overlap = 15.0  # seconds of overlap between chunks to avoid cutting mid-segment
@@ -757,9 +821,12 @@ def step_transcribe(workdir: Path, model: str, language: str | None,
         all_segments: list[dict] = []
         for idx, (start, dur) in enumerate(boundaries):
             cache_file = cache_dir / f"chunk-{idx:03d}.json"
-            if cache_file.exists():
+            cache_key = {**provenance, "start": start, "duration": dur}
+            payload = json.loads(cache_file.read_text()) if cache_file.exists() else {}
+            if payload.get("_cache") == cache_key or (
+                    "_cache" not in payload and legacy_mistral
+                    and chunk_minutes == API_MAX_CHUNK_MINUTES and payload.get("model") == model):
                 log(f"transcribe: chunk {idx} [{start:.0f}s +{dur:.0f}s] cached -> {cache_file.name}")
-                payload = json.loads(cache_file.read_text())
                 raw_segs = payload["segments"]
                 # usage of a cached chunk was already recorded in the ledger when the
                 # API call was made; only accumulate it into the transcript totals
@@ -768,19 +835,22 @@ def step_transcribe(workdir: Path, model: str, language: str | None,
                 chunk = workdir / f"chunk-{idx:03d}.mp3"
                 log(f"transcribe: chunk {idx} [{start:.0f}s +{dur:.0f}s] of {duration:.0f}s")
                 extract_audio_chunk(raw_mp4, start, dur, chunk)
-                raw_segs, usage = transcribe_chunk(chunk, model, language, api_key,
-                                                   max_retries=max_retries, retry_base=retry_base,
-                                                   retry_max=retry_max)
-                chunk.unlink(missing_ok=True)
+                try:
+                    raw_segs, usage = transcribe_chunk(
+                        chunk, model, language, api_key, max_retries=max_retries,
+                        retry_base=retry_base, retry_max=retry_max, provider=provider)
+                finally:
+                    chunk.unlink(missing_ok=True)
+                if provider == "openai" and not usage.get("seconds"):
+                    usage["seconds"] = dur
                 if acct is not None:
                     acct.record(step="transcribe", model=model,
-                                detail=f"chunk-{idx:03d} [{start:.0f}s +{dur:.0f}s]",
-                                **transcribe_usage_fields(usage),
-                                cost_usd=transcribe_cost_usd(usage))
+                                detail=f"chunk-{idx:03d} [{start:.0f}s +{dur:.0f}s] provider={provider}",
+                                **transcribe_usage_fields(usage, provider),
+                                cost_usd=transcribe_cost_usd(usage, provider))
                 accumulate_usage(total_usage, usage)
-                tmp = cache_file.with_suffix(".tmp")
-                tmp.write_text(json.dumps({"model": model, "usage": usage, "segments": raw_segs}))
-                tmp.rename(cache_file)  # atomic: only complete results are cached
+                write_stage_json(cache_file, {"_cache": cache_key, "model": model,
+                                              "usage": usage, "segments": raw_segs})
             for s in raw_segs:
                 s = dict(s)
                 s["start"] += start
@@ -791,14 +861,15 @@ def step_transcribe(workdir: Path, model: str, language: str | None,
                 all_segments.append(s)
         all_segments.sort(key=lambda s: s["start"])
         segments = all_segments
-    doc = {"model": model, "segments": segments}
+    doc = {"model": model, "provider": provider, "segments": segments, "_cache": provenance}
     if total_usage:
         doc["usage"] = total_usage
-        doc["cost_usd"] = round(transcribe_cost_usd(total_usage), 6)
-    (workdir / "transcript.json").write_text(json.dumps(doc, indent=2))
+        doc["cost_usd"] = round(transcribe_cost_usd(total_usage, provider), 6)
+    (workdir / ".edit-done").unlink(missing_ok=True)
     write_srt(segments, workdir / "raw.srt")
     (workdir / "transcript.txt").write_text(
         "\n".join(f"[{srt_ts(s['start'])[:8]}] {s['text'].strip()}" for s in segments))
+    write_stage_json(transcript_json, doc)
     log(f"transcribe: {len(segments)} segments -> transcript.json, raw.srt, transcript.txt"
         + (f" (usage {total_usage}, cost ${doc['cost_usd']:.4f})" if total_usage else ""))
     return segments
@@ -1048,7 +1119,7 @@ def build_pi_oneshot_cmd(pi_bin: str, model: str, effort: str,
 
 
 def save_pi_transcript(workdir: Path, session_scratch: Path, acct: Accounting | None,
-                       model_fallback: str) -> dict | None:
+                       model_fallback: str, provider: str = "mistral") -> dict | None:
     """Copy the pi session file out of agent-scratch into the workdir and extract a
     plain-JSON transcript next to it; record the run's API usage in the ledger.
     Returns the extracted transcript (None if pi wrote no session file)."""
@@ -1059,12 +1130,14 @@ def save_pi_transcript(workdir: Path, session_scratch: Path, acct: Accounting | 
     transcript = extract_pi_transcript(session_out)
     (workdir / PI_TRANSCRIPT_NAME).write_text(json.dumps(transcript, indent=2))
     totals = transcript["usage"]
-    cost = totals["cost"]["total"] or estimate_chat_cost_usd(totals)
+    model = transcript.get("model") or model_fallback
+    provider = transcript.get("provider") or provider
+    cost = totals["cost"]["total"] or estimate_chat_cost_usd(totals, provider, model)
     n_req = sum(1 for m in transcript["messages"]
                 if m["role"] == "assistant" and m.get("usage"))
     if acct is not None:
-        acct.record(step="segment", model=transcript.get("model") or model_fallback,
-                    detail=f"pi oneshot (session {str(transcript.get('session_id'))[:8]})",
+        acct.record(step="segment", model=model,
+                    detail=f"pi oneshot (session {str(transcript.get('session_id'))[:8]}) provider={provider}",
                     requests=max(n_req, 1), **pi_usage_fields(totals), cost_usd=cost)
     log(f"segment: pi transcript -> {session_out.name} + {PI_TRANSCRIPT_NAME} "
         f"({n_req} api response(s), {totals['totalTokens']} tokens, ${cost:.4f})")
@@ -1078,11 +1151,11 @@ def save_pi_transcript(workdir: Path, session_scratch: Path, acct: Accounting | 
 # transient/random failure and retried up to PI_MAX_ATTEMPTS times.
 PI_FATAL_CAUSES = [
     (r"payment required|insufficient (balance|credits|funds)|out of (credits|money)|"
-     r"credit balance|top[- ]?up your|\b402\b|quota exceeded|billing",
-     "API balance/billing problem -- the Mistral workspace looks out of money/credits"),
+     r"credit balance|top[- ]?up your|\b402\b|quota exceeded|insufficient_quota|billing",
+     "API balance/billing problem -- the provider account looks out of money/credits"),
     (r"\b401\b|\b403\b|unauthorized|forbidden|invalid( or missing)? api key|"
      r"authentication (error|failed)|api key not (valid|found)",
-     "auth problem -- bad or missing MISTRAL_API_KEY"),
+     "auth problem -- bad or missing provider API key"),
     (r"context length|too many tokens|maximum context|prompt (is )?too long|"
      r"exceeds the model'?s (context|limit)",
      "prompt too large for the model"),
@@ -1150,20 +1223,35 @@ def pi_failure_diagnostics(proc: subprocess.CompletedProcess,
 
 def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
                  mock_segments: Path | None, day_title: str | None = None,
-                 sandbox: str = "auto", acct: Accounting | None = None) -> dict:
+                 sandbox: str = "auto", acct: Accounting | None = None, *,
+                 provider: str = "mistral") -> dict:
     """Segment one video into segments > sections. day_title (config mode only) is
     the day this video belongs to, given by the caller -- passed to the prompt as
     context; the model never guesses days."""
     segments_json = workdir / "segments.json"
+    transcript_json = workdir / "transcript.json"
+    source = mock_segments if mock_segments else transcript_json
+    source_bytes = source.read_bytes() if source.exists() else None
+    provenance = {"provider": provider, "model": model, "effort": effort,
+                  "day_title": day_title, "mock": bool(mock_segments),
+                  "source_sha256": hashlib.sha256(source_bytes).hexdigest()
+                  if source_bytes is not None else None}
     if segments_json.exists():
-        log("segment: segments.json exists, skipping")
-        return json.loads(segments_json.read_text())
+        cached = json.loads(segments_json.read_text())
+        if cached.get("_cache") == provenance or (
+                "_cache" not in cached and not mock_segments and provider == "mistral"
+                and model == DEFAULT_SEGMENT_MODEL and effort == DEFAULT_EFFORT
+                and (source_bytes is None or "_cache" not in json.loads(source_bytes))):
+            log("segment: segments.json matches, skipping")
+            return cached
+        log("segment: segments.json was produced with different settings or input")
     duration = probe_duration(workdir / "raw.mp4")
     if mock_segments:
         log(f"segment: using mock segments {mock_segments}")
         data = json.loads(mock_segments.read_text())
     else:
-        transcript = json.loads((workdir / "transcript.json").read_text())["segments"]
+        transcript = json.loads(source_bytes if source_bytes is not None
+                                else transcript_json.read_bytes())["segments"]
         will_sandbox = resolve_sandbox(sandbox)
         prompt = build_segment_prompt(workdir, transcript, day_title=day_title,
                                       sandboxed=will_sandbox)
@@ -1176,9 +1264,9 @@ def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
         # Absolute path: pi resolves a relative --session path against its own cwd.
         if shutil.which(pi_bin) is None:
             sys.exit(f"ERROR: pi binary not found: {pi_bin!r} (install pi, or set --pi-bin / PI_BIN)")
-        if not os.environ.get("MISTRAL_API_KEY"):
-            log("segment: WARNING MISTRAL_API_KEY is not set -- the bare-config pi run has no "
-                "Mistral auth (pi falls back to this env var) and will fail with an auth error")
+        api_key_env = PROVIDER_API_KEYS.get(provider)
+        if api_key_env and not os.environ.get(api_key_env):
+            log(f"segment: WARNING {api_key_env} is not set -- pi uses it for {provider} auth")
         scratch = (workdir / "agent-scratch").resolve()
         scratch.mkdir(exist_ok=True)
         session_scratch = scratch / PI_SESSION_NAME
@@ -1209,7 +1297,7 @@ def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
                 sys.exit(f"ERROR: cannot run pi: {cmd[0]!r} not found/executable ({e}); "
                          f"install pi or set --pi-bin / PI_BIN")
             # save the transcript + record the spend even of a failed attempt
-            transcript = save_pi_transcript(workdir, session_scratch, acct, model)
+            transcript = save_pi_transcript(workdir, session_scratch, acct, model, provider)
             if proc.returncode == 0:
                 break
             diag = pi_failure_diagnostics(proc, transcript)
@@ -1219,8 +1307,8 @@ def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
                          f"{attempt}/{PI_MAX_ATTEMPTS}: {cause} -- NOT retried, a retry "
                          f"would send the identical request.\n{diag}\n"
                          f"pi session: {workdir / PI_SESSION_NAME} (spend already in the usage "
-                         f"ledger). Fix the cause -- e.g. top up the Mistral API balance, set "
-                         f"MISTRAL_API_KEY, shrink the prompt, pick an existing model -- and "
+                         f"ledger). Fix the cause -- e.g. top up the {provider} API balance, set "
+                         f"{api_key_env or 'the provider API key'}, shrink the prompt, pick an existing model -- and "
                          f"re-run the same command.")
             if attempt == PI_MAX_ATTEMPTS:
                 sys.exit(f"ERROR: pi failed after {PI_MAX_ATTEMPTS} attempts "
@@ -1235,7 +1323,9 @@ def step_segment(workdir: Path, model: str, effort: str, pi_bin: str,
         (workdir / "segment-raw-output.txt").write_text(proc.stdout)
         data = extract_json_block(proc.stdout)
     data = validate_segments(data, duration)
-    segments_json.write_text(json.dumps(data, indent=2))
+    data["_cache"] = provenance
+    (workdir / ".edit-done").unlink(missing_ok=True)
+    write_stage_json(segments_json, data)
     segs = segments_of(data)
     n_sec = sum(len(s["sections"]) for s in segs)
     n_break = sum(1 for s in segs for sec in s["sections"] if sec["kind"] == "break")
@@ -1515,9 +1605,11 @@ BUILTIN_DEFAULTS = {
     "workdir_root": "work",          # config mode: base dir for per-day workdirs
     "height": 1080,
     "language": None,
-    "transcribe_model": DEFAULT_TRANSCRIBE_MODEL,
-    "segment_model": DEFAULT_SEGMENT_MODEL,
-    "effort": DEFAULT_EFFORT,
+    "transcribe_provider": None,
+    "segment_provider": None,
+    "transcribe_model": None,
+    "segment_model": None,
+    "effort": None,
     "chunk_minutes": API_MAX_CHUNK_MINUTES,
     "subs": "embed",
     "reencode": False,
@@ -1557,13 +1649,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="max video height for download (0 = best available)")
     ap.add_argument("--language", default=None,
                     help="ISO 639-1 language code for transcription (default: auto-detect)")
+    ap.add_argument("--transcribe-provider", choices=PROVIDER_DEFAULTS,
+                    help="provider for audio transcription (default: mistral)")
+    ap.add_argument("--segment-provider", choices=PROVIDER_DEFAULTS,
+                    help="provider for pi segmentation (default: mistral)")
     ap.add_argument("--transcribe-model", default=None)
     ap.add_argument("--segment-model", default=None,
                     help="pi model for segmentation (Mistral Large line; literal Large 3 id: mistral/mistral-large-2512)")
     ap.add_argument("--effort", default=None,
                     help="pi thinking/effort level for segmentation")
     ap.add_argument("--chunk-minutes", type=int, default=None,
-                    help="audio chunk size for transcription (API max is 60)")
+                    help="audio chunk size in minutes (default: 55, OpenAI uploads must be under 25 MB)")
     ap.add_argument("--subs", choices=["embed", "burn", "sidecar"], default=None,
                     help="how to apply subtitles to outputs (default: embed as mov_text)")
     ap.add_argument("--reencode", action="store_true", default=None,
@@ -1612,8 +1708,26 @@ def _norm_keys(table: dict, where: str) -> dict:
             sys.exit(f"ERROR: subs must be embed|burn|sidecar, got {v!r} in {where}")
         if key == "sandbox" and v not in ("auto", "bwrap", "none"):
             sys.exit(f"ERROR: sandbox must be auto|bwrap|none, got {v!r} in {where}")
+        if key in ("transcribe_provider", "segment_provider") and v not in tuple(PROVIDER_DEFAULTS):
+            sys.exit(f"ERROR: {key} must be mistral|openai, got {v!r} in {where}")
         out[key] = v
     return out
+
+
+def validate_provider_config(providers: dict, path: Path) -> None:
+    if not isinstance(providers, dict):
+        sys.exit(f"ERROR: providers must be a table in {path}")
+    for provider, stages in providers.items():
+        if provider not in PROVIDER_DEFAULTS or not isinstance(stages, dict):
+            sys.exit(f"ERROR: invalid provider table providers.{provider} in {path}")
+        for stage, settings in stages.items():
+            defaults = PROVIDER_DEFAULTS[provider].get(stage)
+            where = f"providers.{provider}.{stage} in {path}"
+            if defaults is None or not isinstance(settings, dict):
+                sys.exit(f"ERROR: invalid provider stage table {where}")
+            for key, value in settings.items():
+                if key not in defaults or not isinstance(value, str) or not value.strip():
+                    sys.exit(f"ERROR: invalid setting {key}={value!r} in {where}")
 
 
 def load_config(path: Path) -> tuple[dict, list[dict]]:
@@ -1628,7 +1742,10 @@ def load_config(path: Path) -> tuple[dict, list[dict]]:
     days = raw.pop("days", None)
     if not days:
         sys.exit(f"ERROR: {path} has no [[days]] entries (each entry is one day video)")
+    providers = raw.pop("providers", {})
+    validate_provider_config(providers, path)
     globals_ = _norm_keys(raw, str(path))
+    globals_["providers"] = providers
     entries: list[dict] = []
     for i, d in enumerate(days, 1):
         if not isinstance(d, dict):
@@ -1668,6 +1785,54 @@ def resolve_options(cli: argparse.Namespace, toml_globals: dict,
         if v is None:
             v = default
         opt[key] = v
+
+    chunk_minutes = opt["chunk_minutes"]
+    if type(chunk_minutes) is not int or chunk_minutes <= 0:
+        sys.exit("ERROR: chunk_minutes must be a positive integer")
+    providers = toml_globals.get("providers", {})
+    day_options = overrides or {}
+    for stage in ("transcribe", "segment"):
+        provider_key, model_key = f"{stage}_provider", f"{stage}_model"
+        explicit_provider = opt[provider_key]
+        model = opt[model_key]
+        if explicit_provider:
+            event_provider = toml_globals.get(provider_key)
+            if not event_provider and stage == "segment":
+                event_model = toml_globals.get(model_key)
+                if isinstance(event_model, str) and "/" in event_model:
+                    event_provider = event_model.split("/", 1)[0]
+            event_provider = event_provider or "mistral"
+            day_provider = day_options.get(provider_key, event_provider)
+            # Provider switches carry forward only the matching TOML overrides.
+            scoped = {}
+            if event_provider == explicit_provider:
+                scoped.update(toml_globals)
+            if day_provider == explicit_provider:
+                scoped.update(day_options)
+            model = getattr(cli, model_key, None)
+            if model is None:
+                model = scoped.get(model_key)
+            if stage == "segment" and getattr(cli, "effort", None) is None:
+                opt["effort"] = scoped.get("effort")
+        if model is not None and (not isinstance(model, str) or not model.strip()):
+            sys.exit(f"ERROR: {model_key} must be a nonempty string")
+        # A qualified legacy pi model can still select its own provider.
+        model_provider = model.split("/", 1)[0] if stage == "segment" and model and "/" in model else None
+        provider = explicit_provider or model_provider or "mistral"
+        defaults = PROVIDER_DEFAULTS.get(provider, {}).get(stage, {})
+        settings = providers.get(provider, {}).get(stage, {})
+        model = model or settings.get("model") or defaults.get("model")
+        if stage == "segment":
+            prefix, sep, _ = model.partition("/")
+            if sep and prefix != provider:
+                sys.exit(f"ERROR: segment_model {model!r} does not match segment_provider {provider!r}")
+            if not sep and (explicit_provider or opt[model_key] is None):
+                model = f"{provider}/{model}"
+            opt["effort"] = opt["effort"] or settings.get("effort") or DEFAULT_EFFORT
+            if not isinstance(opt["effort"], str):
+                sys.exit("ERROR: effort must be a string")
+        opt[provider_key] = provider
+        opt[model_key] = model
     return opt
 
 
@@ -1713,14 +1878,15 @@ def run_pipeline(opt: dict, source: dict, day_title: str | None,
         step_transcribe(workdir, opt["transcribe_model"], opt["language"],
                         opt["chunk_minutes"], opt["mock_transcript"],
                         max_retries=opt["max_retries"], retry_base=opt["retry_base_seconds"],
-                        retry_max=opt["retry_max_seconds"], acct=acct)
+                        retry_max=opt["retry_max_seconds"], acct=acct,
+                        provider=opt["transcribe_provider"])
     else:
         log("transcribe: skipped")
 
     if not opt["skip_segment"]:
         data = step_segment(workdir, opt["segment_model"], opt["effort"],
                             opt["pi_bin"], opt["mock_segments"], day_title=day_title,
-                            sandbox=opt["sandbox"], acct=acct)
+                            sandbox=opt["sandbox"], acct=acct, provider=opt["segment_provider"])
     else:
         log("segment: skipped")
         data = json.loads((workdir / "segments.json").read_text())

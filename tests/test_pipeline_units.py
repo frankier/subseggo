@@ -299,16 +299,123 @@ class AccountingTests(unittest.TestCase):
         import io
         self.acct.record(step="segment", detail="pi oneshot", model="m",
                          total_tokens=45, cost_usd=0.000136)
+        second = pipeline.Accounting(self.csv, "Day 2")
+        second.record(step="transcribe", detail="chunk-000 provider=openai", model="whisper-1",
+                      audio_seconds=10, cost_usd=0.001)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            pipeline.report_api_usage([self.acct])
+            pipeline.report_api_usage([self.acct, second])
             pipeline.report_api_usage([])  # no accts: no-op
         out = buf.getvalue()
         self.assertIn("API usage this run", out)
         self.assertIn("[Day 1] segment", out)
         self.assertIn("total API usage (ledger)", out)
         self.assertIn("TOTAL", out)
-        self.assertIn(str(self.csv), out)
+        self.assertIn(f"TOTAL {self.csv}: 2 req", out)
+
+
+class ProviderConfigTests(unittest.TestCase):
+    def test_defaults_and_provider_overrides(self):
+        defaults = pipeline.resolve_options(pipeline.parse_args([]), {})
+        self.assertEqual(defaults["transcribe_provider"], "mistral")
+        self.assertEqual(defaults["segment_provider"], "mistral")
+        self.assertEqual(defaults["transcribe_model"], "voxtral-small-transcribe-3")
+        self.assertEqual(defaults["segment_model"], "mistral/mistral-large-latest")
+        self.assertEqual(defaults["effort"], "medium")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "event.toml"
+            config.write_text("""
+transcribe_provider = "mistral"
+transcribe_model = "voxtral-custom"
+segment_provider = "openai"
+
+[providers.openai.segment]
+model = "gpt-6.1-terra"
+effort = "high"
+
+[[days]]
+path = "day-1.mp4"
+transcribe_provider = "openai"
+
+[[days]]
+path = "day-2.mp4"
+segment_provider = "mistral"
+""")
+            event, days = pipeline.load_config(config)
+
+        cli = pipeline.parse_args([])
+        first = pipeline.resolve_options(cli, event, days[0]["overrides"])
+        self.assertEqual(first["transcribe_model"], "whisper-1")
+        self.assertEqual(first["segment_model"], "openai/gpt-6.1-terra")
+        self.assertEqual(first["effort"], "high")
+        second = pipeline.resolve_options(cli, event, days[1]["overrides"])
+        self.assertEqual(second["transcribe_model"], "voxtral-custom")
+        self.assertEqual(second["segment_model"], "mistral/mistral-large-latest")
+        self.assertEqual(second["effort"], "medium")
+
+        cli = pipeline.parse_args(["--segment-provider", "openai", "--effort", "low"])
+        second = pipeline.resolve_options(cli, event, days[1]["overrides"])
+        self.assertEqual(second["segment_model"], "openai/gpt-6.1-terra")
+        self.assertEqual(second["effort"], "low")
+
+    def test_legacy_qualified_pi_model_still_selects_provider(self):
+        cli = pipeline.parse_args(["--segment-model", "openai/gpt-6.1-terra"])
+        options = pipeline.resolve_options(cli, {})
+        self.assertEqual(options["segment_provider"], "openai")
+        self.assertEqual(options["effort"], "medium")
+
+
+class TranscriptionProviderTests(unittest.TestCase):
+    def test_switch_to_openai_replaces_mistral_cache_and_resumes_without_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / "raw.mp4").write_bytes(b"video")
+            (work / "transcript.json").write_text(json.dumps(
+                {"model": "voxtral-small-transcribe-3", "segments": []}))
+            (work / "chunks").mkdir()
+            (work / "chunks/chunk-000.json").write_text(json.dumps(
+                {"model": "voxtral-small-transcribe-3", "segments": []}))
+            (work / ".edit-done").touch()
+            acct = pipeline.Accounting(work / "api-usage.csv", "Day 1")
+
+            response = mock.Mock(status_code=200)
+            response.json.return_value = {
+                "duration": 10, "text": "Hello",
+                "segments": [{"start": 1, "end": 3, "text": "Hello"}],
+            }
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), \
+                    mock.patch.object(pipeline, "probe_duration", return_value=10), \
+                    mock.patch.object(pipeline, "extract_audio_chunk",
+                                      side_effect=lambda _raw, _start, _dur, out: out.touch()), \
+                    mock.patch.object(pipeline.requests, "post", return_value=response) as post:
+                segments = pipeline.step_transcribe(work, "whisper-1", "en", 55, None,
+                                                     acct=acct, provider="openai")
+
+            post.assert_called_once()
+            self.assertEqual(post.call_args.args[0], f"{pipeline.OPENAI_API_BASE}/audio/transcriptions")
+            self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer test-key")
+            self.assertEqual(post.call_args.kwargs["data"], {
+                "model": "whisper-1", "response_format": "verbose_json",
+                "timestamp_granularities[]": "segment", "language": "en",
+            })
+            self.assertEqual(segments, [{"start": 1.0, "end": 3.0, "text": "Hello", "speaker_id": None}])
+            self.assertIn("00:00:01,000 --> 00:00:03,000", (work / "raw.srt").read_text())
+            self.assertFalse((work / ".edit-done").exists())
+            self.assertEqual(acct.rows[0]["audio_seconds"], 10)
+            self.assertAlmostEqual(acct.rows[0]["cost_usd"], 0.001)
+            self.assertIn("provider=openai", acct.rows[0]["detail"])
+
+            with mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(pipeline.step_transcribe(work, "whisper-1", "en", 55, None,
+                                                          provider="openai"), segments)
+            (work / "transcript.json").unlink()
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), \
+                    mock.patch.object(pipeline, "probe_duration", return_value=10), \
+                    mock.patch.object(pipeline.requests, "post") as post:
+                self.assertEqual(pipeline.step_transcribe(work, "whisper-1", "en", 55, None,
+                                                          provider="openai"), segments)
+            post.assert_not_called()
 
 
 class PiOneshotCmdTests(unittest.TestCase):
@@ -446,6 +553,34 @@ class StepSegmentTranscriptTests(unittest.TestCase):
         self.assertIsNone(pipeline.save_pi_transcript(self.workdir, self.dir / "nope.jsonl",
                                                       self.acct, "m"))
         self.assertEqual(self.acct.rows, [])
+
+    def test_terra_cache_tracks_effort_and_transcript(self):
+        (self.workdir / "segments.json").write_text('{"segments": []}')
+        (self.workdir / ".edit-done").touch()
+
+        def run_segment(effort):
+            return pipeline.step_segment(self.workdir, "openai/gpt-6.1-terra", effort,
+                                         "pi", None, sandbox="none", provider="openai")
+
+        with mock.patch.object(pipeline, "probe_duration", return_value=100.0), \
+                mock.patch.object(pipeline, "pi_supports_effort", return_value=False), \
+                mock.patch.object(pipeline, "pi_supports_tools", return_value=True), \
+                mock.patch.object(pipeline.shutil, "which", return_value="/usr/bin/pi"), \
+                mock.patch.object(pipeline.subprocess, "run", side_effect=self._fake_pi_run) as pi:
+            first = run_segment("medium")
+            self.assertEqual(run_segment("medium"), first)
+            self.assertEqual(pi.call_count, 1)
+            cmd = pi.call_args.args[0]
+            self.assertEqual(cmd[cmd.index("--model") + 1], "openai/gpt-6.1-terra")
+            self.assertEqual(cmd[cmd.index("--thinking") + 1], "medium")
+            self.assertFalse((self.workdir / ".edit-done").exists())
+
+            run_segment("high")
+            self.assertEqual(pi.call_count, 2)
+            (self.workdir / "transcript.json").write_text(json.dumps(
+                {"segments": [{"start": 0.0, "end": 10.0, "text": "different transcript"}]}))
+            run_segment("high")
+            self.assertEqual(pi.call_count, 3)
 
 
 class ClassifyPiFailureTests(unittest.TestCase):

@@ -3,9 +3,9 @@
 `pipeline.py` is a PEP 723 script (`uv run --script`) that:
 
 1. **download** – grabs a YouTube video with `yt-dlp` → `work/<video_id>/raw.mp4`
-2. **transcribe** – chunks the audio (≤ 55 min per request, the Mistral API limit is
-   60 min / 500 MB) and sends each chunk to `POST /v1/audio/transcriptions` with
-   **Voxtral-3-small** (`voxtral-small-transcribe-3`), `timestamp_granularities=segment`
+2. **transcribe** – chunks the audio (55 minutes by default) and sends each chunk
+   to the selected provider's `POST /v1/audio/transcriptions` endpoint. The
+   default is **Voxtral-3-small** (`voxtral-small-transcribe-3`) with segment timestamps
    → `transcript.json`, `raw.srt`, `transcript.txt`
 3. **segment** – pipes the timestamped transcript to **`pi` in oneshot mode**
    (`pi --print --session <workdir>/agent-scratch/pi-session.jsonl --model
@@ -15,7 +15,7 @@
    `PI_CODING_AGENT_DIR` points at a fresh empty dir in `agent-scratch/`, so the
    user's `~/.pi/agent` (settings, extensions, custom models, auth) is never read —
    same as inside the Docker image, where no `~/.pi/agent` exists; the API key comes
-   from `MISTRAL_API_KEY` in the environment. The command asks the Mistral-Large model to
+   from the selected provider's environment variable. The command asks the model to
    segment hierarchically into **segments (icebreaker/episode) → sections
    (content/exercise/break)** → intermediate format `segments.json`. Days are never
    guessed: with `--config` each video is one day named by its `[[days]]` entry;
@@ -73,10 +73,12 @@ not re-billed), so re-running a command never double-counts. Transcription usage
 `workdir/chunks/chunk-NNN.json` and aggregated into `transcript.json`; the segment
 step's usage/cost is read from `pi-transcript.json`.
 
-Costs: the APIs return usage, not cost, so USD is computed from list prices —
-transcription is billed per audio hour, the pi run uses pi's own catalog-derived cost
-from the session. Override the defaults via env if pricing changes:
-`MISTRAL_TRANSCRIBE_USD_PER_AUDIO_HOUR` (default 0.24), `MISTRAL_USD_PER_1M_INPUT`
+The `detail` field includes the provider on new rows. Transcription cost is
+estimated from list prices and audio duration. The segmentation ledger uses pi's
+catalog-derived cost from the session when available. Override transcription
+prices with `OPENAI_TRANSCRIBE_USD_PER_AUDIO_HOUR` (Whisper default 0.36) or
+`MISTRAL_TRANSCRIBE_USD_PER_AUDIO_HOUR` (default 0.24). Mistral token-price
+fallbacks can be overridden with `MISTRAL_USD_PER_1M_INPUT`
 (2.0), `MISTRAL_USD_PER_1M_OUTPUT` (6.0), `MISTRAL_USD_PER_1M_CACHE_READ` (0.2),
 `MISTRAL_USD_PER_1M_CACHE_WRITE` (0.0).
 
@@ -126,11 +128,56 @@ built-in default).
 Requirements on PATH: `uv`, `ffmpeg`, `ffprobe`, ImageMagick (`compare`, used when the
 segment model fine-tunes cut points visually), `pi`, `node` (yt-dlp JS runtime).
 Options: `--language en`, `--subs embed|burn|sidecar`, `--reencode`,
+`--transcribe-provider`, `--segment-provider`,
 `--transcribe-model`, `--segment-model`, `--effort`, `--chunk-minutes`,
 `--skip-download/--skip-transcribe/--skip-segment/--skip-edit`, `--force-edit`,
 `--no-snap-keyframes`, `--sandbox auto|bwrap|none`, `--mock-transcript`,
 `--mock-segments` (offline testing).
 See `--help`.
+
+## Providers
+
+Transcription and segmentation each default to Mistral. Set either provider to
+`"openai"` at the top level or in a `[[days]]` entry, or pass the corresponding
+CLI flag. Supply `MISTRAL_API_KEY` and/or `OPENAI_API_KEY` in the environment for
+the stages that make API calls. For Docker, pass the keys with `-e MISTRAL_API_KEY`
+and/or `-e OPENAI_API_KEY`.
+
+| Provider | Transcription model | Segmentation model | Segmentation effort |
+| --- | --- | --- | --- |
+| `mistral` | `voxtral-small-transcribe-3` | `mistral/mistral-large-latest` | `medium` |
+| `openai` | `whisper-1` | `openai/gpt-6.1-terra` | `medium` |
+
+For example, this event uses Voxtral for transcription and Terra for
+segmentation. To switch transcription to OpenAI, set
+`transcribe_provider = "openai"`.
+
+```toml
+transcribe_provider = "mistral"
+segment_provider = "openai"
+
+[providers.openai.transcribe]
+model = "whisper-1"
+
+[providers.openai.segment]
+model = "gpt-6.1-terra"
+effort = "medium"
+
+[[days]]
+path = "recordings/day-1.mp4"
+title = "Day 1"
+```
+
+The provider tables are optional. Existing `transcribe_model`, `segment_model`
+and `effort` overrides take precedence over the selected provider's settings.
+If a day or CLI flag switches providers, model and effort overrides from TOML
+apply only where the provider matches. OpenAI transcription model overrides must
+support segment timestamps in `verbose_json`.
+
+OpenAI transcription uses Whisper's timestamped response as a temporary bridge
+until its [scheduled shutdown on February 26, 2027](https://developers.openai.com/api/docs/guides/speech-to-text#timestamps).
+OpenAI audio uploads must be under 25 MB. The default 55-minute MP3 chunks fit
+under this limit. Set a smaller `chunk_minutes` if needed.
 
 ## Retries and resuming a partial run
 
@@ -143,7 +190,9 @@ See `--help`.
   chunk), just **re-run the same command**: finished chunks are loaded from cache
   and only the missing ones are re-requested. Same for the other stages:
   `raw.mp4`, `transcript.json`, `segments.json` and the `.edit-done` marker make
-  download/transcribe/segment/edit resumable; `--skip-*` forces skipping a stage
+  download/transcribe/segment/edit resumable. A provider, model or effort change
+  refreshes the affected stage and its downstream outputs. Use distinct workdirs
+  to keep outputs from both runs for comparison. `--skip-*` forces skipping a stage
   and `--force-edit` redoes the edit stage.
 - `workdir/keyframes.json` (the video keyframe probe used for cut snapping) is
   probed once right after download and cached with a fingerprint of `raw.mp4`
@@ -166,9 +215,9 @@ unsandboxed.
 Independently of the sandbox, pi never uses the user's `~/.pi/agent`: every pi
 invocation (including the `--help` capability probes) gets `PI_CODING_AGENT_DIR`
 pointing at a freshly emptied `workdir/agent-scratch/pi-agent/`, so pi runs on its
-built-in defaults — the same bare configuration as inside the Docker image. The
-mistral API key is taken from `MISTRAL_API_KEY` in the environment (pi's env-var
-fallback), and the model comes from pi's built-in catalog via `--model`. The bare
+built-in defaults — the same bare configuration as inside the Docker image. Pi
+reads the selected provider's API key from the environment and resolves the
+model from its built-in catalog via `--model`. The bare
 dir lives in `agent-scratch/`, so it is writable both inside the bwrap sandbox
 (the only writable bind) and outside. Unit tests:
 `uv run --script tests/test_pipeline_units.py`.
