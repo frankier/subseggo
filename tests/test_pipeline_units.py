@@ -101,6 +101,79 @@ class ProbeKeyframesTests(unittest.TestCase):
         self.assertEqual(kfs, [[0.0, -0.033333], [5.0, 5.0]])
 
 
+class ProbeAudioSilencesTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.mp4 = self.dir / "raw.mp4"
+        self.mp4.write_bytes(b"\x00" * 4096)
+
+    def _probe(self, stderr: str, returncode: int = 0):
+        fake = subprocess.CompletedProcess([], returncode, stdout="", stderr=stderr)
+        with mock.patch.object(pipeline.subprocess, "run", return_value=fake), \
+                mock.patch.object(pipeline, "which_or_die", side_effect=lambda n: n), \
+                mock.patch.object(pipeline, "probe_duration", return_value=100.0):
+            return pipeline.probe_audio_silences(self.mp4)
+
+    def test_parses_silencedetect_output(self):
+        stderr = ("[Parsed_silencedetect_0 @ 0x1] silence_start: 0\n"
+                  "[Parsed_silencedetect_0 @ 0x1] silence_end: 428.714853 | "
+                  "silence_duration: 428.714853\n"
+                  "[Parsed_silencedetect_0 @ 0x1] silence_start: 430.056417\n"
+                  "[Parsed_silencedetect_0 @ 0x1] silence_end: 431.044059 | "
+                  "silence_duration: 0.987642\n")
+        self.assertEqual(self._probe(stderr), [[0.0, 428.714853], [430.056417, 431.044059]])
+
+    def test_trailing_silence_is_clamped_to_duration(self):
+        # ffmpeg can end the file without emitting silence_end
+        stderr = "[Parsed_silencedetect_0 @ 0x1] silence_start: 90.5\n"
+        self.assertEqual(self._probe(stderr), [[90.5, 100.0]])
+
+    def test_failure_means_whole_file_is_speech(self):
+        self.assertEqual(self._probe("no audio stream", returncode=1), [])
+
+
+class SilenceCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.mp4 = self.dir / "raw.mp4"
+        self.mp4.write_bytes(b"\x00" * (1 << 20))
+        self.cache = self.dir / "silences.json"
+        self.params = pipeline.silence_params(-60.0, 0.5)
+
+    def test_roundtrip_is_atomic(self):
+        sil = [[0.0, 428.7], [12309.7, 12657.4]]
+        pipeline.write_silence_cache(self.cache, self.mp4, sil, self.params)
+        self.assertFalse((self.dir / "silences.json.tmp").exists())
+        payload = json.loads(self.cache.read_text())
+        self.assertEqual(payload["version"], pipeline.SILENCE_CACHE_VERSION)
+        self.assertEqual(payload["params"], self.params)
+        self.assertEqual(pipeline.load_silence_cache(self.cache, self.mp4, self.params), sil)
+
+    def test_changed_analysis_params_invalidate(self):
+        pipeline.write_silence_cache(self.cache, self.mp4, [[0.0, 1.0]], self.params)
+        other = pipeline.silence_params(-45.0, 0.5)
+        self.assertIsNone(pipeline.load_silence_cache(self.cache, self.mp4, other))
+
+    def test_stale_fingerprint_is_ignored(self):
+        pipeline.write_silence_cache(self.cache, self.mp4, [[0.0, 1.0]], self.params)
+        with self.mp4.open("ab") as f:
+            f.write(b"x")
+        self.assertIsNone(pipeline.load_silence_cache(self.cache, self.mp4, self.params))
+
+    def test_corrupt_cache_is_moved_aside_not_fatal(self):
+        self.cache.write_text("silence_start: 0\n")
+        self.assertIsNone(pipeline.load_silence_cache(self.cache, self.mp4, self.params))
+        self.assertEqual(len(list(self.dir.glob("silences.json.bad-*"))), 1)
+
+    def test_ensure_probes_once_then_uses_cache(self):
+        with mock.patch.object(pipeline, "probe_audio_silences",
+                               return_value=[[0.0, 10.0]]) as pa:
+            pipeline.ensure_silence_cache(self.dir, -60.0, 0.5)
+            pipeline.ensure_silence_cache(self.dir, -60.0, 0.5)
+            pa.assert_called_once()
+        self.assertTrue(self.cache.exists())
+
+
 def make_session_jsonl() -> str:
     """A small synthetic pi session (JSONL) with a tool call and two assistant
     messages carrying usage+cost."""

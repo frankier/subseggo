@@ -114,6 +114,13 @@ API_MAX_CHUNK_MINUTES = 55  # API limit is 60 min / 500 MB per request; stay und
 OPENAI_AUDIO_MAX_BYTES = 25_000_000
 OPENAI_TRANSCRIBE_MODEL = "whisper-1"
 OPENAI_SEGMENT_MODEL = "openai/gpt-6.1-terra"
+# Silence analysis (ffmpeg silencedetect) shared by silence-aware chunking and the
+# post-transcription check. -60 dBFS is well below speech, so a detected silence is
+# genuinely empty rather than a quiet passage.
+DEFAULT_SILENCE_DBFS = -60.0
+DEFAULT_SILENCE_MIN_SECONDS = 0.5   # finest granularity we care about
+DEFAULT_CHUNK_SILENCE_MIN_SECONDS = 30.0  # long enough to hold no speech at all
+DEFAULT_CHUNK_OVERLAP_SECONDS = 60.0
 PROVIDER_API_KEYS = {"mistral": "MISTRAL_API_KEY", "openai": "OPENAI_API_KEY"}
 PROVIDER_DEFAULTS = {
     "mistral": {
@@ -603,6 +610,122 @@ def ensure_keyframe_cache(workdir: Path) -> None:
     kfs = probe_keyframes(raw_mp4)
     write_keyframe_cache(kf_cache, raw_mp4, kfs)
     log(f"keyframes: {len(kfs)} keyframes -> {kf_cache.name}")
+
+
+def probe_audio_silences(mp4: Path, noise_dbfs: float = DEFAULT_SILENCE_DBFS,
+                         min_seconds: float = DEFAULT_SILENCE_MIN_SECONDS) -> list[list[float]]:
+    """Silent stretches of the audio as [start, end] pairs (seconds).
+
+    Uses ffmpeg's `silencedetect`, which reports a stretch once the decoded level
+    stays below `noise_dbfs` for `min_seconds`; shorter gaps are not reported.
+    A silence running into either end of the file is clamped to [0, duration].
+    """
+    try:
+        proc = subprocess.run(
+            [which_or_die("ffmpeg"), "-nostats", "-hide_banner", "-i", str(mp4),
+             "-vn", "-af", f"silencedetect=noise={noise_dbfs}dB:d={min_seconds}",
+             "-f", "null", "-"],
+            capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"WARNING: could not analyse audio silences of {mp4.name} ({e})")
+        return []
+    if proc.returncode != 0:
+        log(f"WARNING: ffmpeg silencedetect failed on {mp4.name} "
+            f"(no audio stream?); treating the whole file as speech")
+        return []
+    sil: list[list[float]] = []
+    start: float | None = None
+    for line in proc.stderr.splitlines():
+        m = re.search(r"silence_start:\s*(-?[\d.]+)", line)
+        if m:
+            start = float(m.group(1))
+            continue
+        m = re.search(r"silence_end:\s*(-?[\d.]+)", line)
+        if m and start is not None:
+            sil.append([max(0.0, start), float(m.group(1))])
+            start = None
+    if start is not None:  # trailing silence that never got its silence_end
+        sil.append([max(0.0, start), probe_duration(mp4)])
+    return sil
+
+
+SILENCE_CACHE_VERSION = 1
+
+
+def write_silence_cache(path: Path, mp4: Path, sil: list[list[float]],
+                        params: dict) -> None:
+    """Write the silence cache atomically (tmp file + rename), like the keyframe one."""
+    payload = {"version": SILENCE_CACHE_VERSION, "source": mp4.name,
+               "fingerprint": file_fingerprint(mp4), "params": params, "silences": sil}
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload))
+    os.replace(tmp, path)
+
+
+def load_silence_cache(path: Path, mp4: Path, params: dict) -> list[list[float]] | None:
+    """Cached silences if `path` is a valid cache for this `mp4` and these analysis
+    parameters, else None. A corrupt or foreign file is moved aside to
+    `<name>.bad-<timestamp>` and None is returned, so the caller re-probes instead
+    of crashing."""
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+        if payload.get("version") != SILENCE_CACHE_VERSION:
+            raise ValueError(f"unsupported cache version {payload.get('version')!r}")
+        if payload.get("fingerprint") != file_fingerprint(mp4):
+            log(f"cache: {path.name} was probed from a different raw.mp4 "
+                f"(fingerprint mismatch) -- ignoring it")
+            return None
+        if payload.get("params") != params:
+            log(f"cache: {path.name} was probed with different silence settings "
+                f"-- ignoring it")
+            return None
+        raw = payload["silences"]
+        if not isinstance(raw, list):
+            raise ValueError("'silences' is not a list")
+        out = []
+        for pair in raw:
+            if (not isinstance(pair, list) or len(pair) != 2
+                    or not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                               for v in pair)):
+                raise ValueError(f"bad silence entry {pair!r}")
+            out.append([float(pair[0]), float(pair[1])])
+        return out
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        bad = path.with_name(f"{path.name}.bad-{int(time.time())}")
+        log(f"WARNING: {path.name} is not a valid silence cache ({e}); "
+            f"moving it aside to {bad.name} and re-probing {mp4.name}")
+        try:
+            os.replace(path, bad)
+        except OSError:
+            pass
+        return None
+
+
+def silence_params(noise_dbfs: float, min_seconds: float) -> dict:
+    return {"noise_dbfs": float(noise_dbfs), "min_seconds": float(min_seconds)}
+
+
+def ensure_silence_cache(workdir: Path, noise_dbfs: float,
+                         min_seconds: float) -> list[list[float]]:
+    """Probe raw.mp4's audio silences once, cached in workdir/silences.json. Used by
+    silence-aware chunking and by the post-transcription coverage check."""
+    raw_mp4 = workdir / "raw.mp4"
+    cache = workdir / "silences.json"
+    if not raw_mp4.exists():
+        return []
+    params = silence_params(noise_dbfs, min_seconds)
+    sil = load_silence_cache(cache, raw_mp4, params)
+    if sil is not None:
+        log(f"silences: loaded {len(sil)} from {cache.name}")
+        return sil
+    log(f"silences: analysing audio of raw.mp4 (noise {noise_dbfs} dBFS, "
+        f"min {min_seconds}s; cached in silences.json)")
+    sil = probe_audio_silences(raw_mp4, noise_dbfs, min_seconds)
+    write_silence_cache(cache, raw_mp4, sil, params)
+    log(f"silences: {len(sil)} silent stretches -> {cache.name}")
+    return sil
 
 
 def snap_to_keyframe(t: float, kfs: list[list[float]]) -> float:
