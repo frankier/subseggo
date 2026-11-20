@@ -4,8 +4,6 @@
 # dependencies = [
 #   "yt-dlp",
 #   "requests",
-#   "pyyaml",
-#   "ffmpeg-editlist[srt]",
 # ]
 # ///
 """
@@ -40,7 +38,7 @@ edit stages are all cached/skipped automatically):
                    -> segments.json (intermediate format: segments > sections; days are
                    never guessed -- with --config each video is one day given by the
                    config entry's title, single-video runs get no day level)
-  4. edit        : segments.json -> editlist.yaml -> ffmpeg-editlist (--srt)
+  4. edit        : segments.json -> keyframe-aligned cuts -> mp4 + rebased .srt
                    -> per-segment mp4 outputs with break sections removed,
                       plus the original mp4 with subtitles applied.
                    Cut points are snapped to video keyframes (raw.mp4 is probed once,
@@ -90,6 +88,7 @@ Requires env: MISTRAL_API_KEY and/or OPENAI_API_KEY for the providers in use.
 from __future__ import annotations
 
 import argparse
+import array
 import csv
 import hashlib
 import json
@@ -101,10 +100,10 @@ import shutil
 import subprocess
 import sys
 import time
+import wave
 from pathlib import Path
 
 import requests
-import yaml
 
 MISTRAL_API_BASE = os.environ.get("MISTRAL_API_BASE", "https://api.mistral.ai/v1")
 OPENAI_API_BASE = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
@@ -729,32 +728,6 @@ def ensure_silence_cache(workdir: Path, noise_dbfs: float,
     return sil
 
 
-def snap_to_keyframe(t: float, kfs: list[list[float]]) -> float:
-    """Editlist start value that makes a stream-copy cut begin exactly at a keyframe.
-
-    ffmpeg `-ss` (output option) with `-c copy` drops packets while dts < ss, so a cut
-    at `t` actually starts at the first keyframe with dts >= t.  Returning that
-    keyframe's dts as the new start keeps the keyframe (dts >= ss) and shrinks the
-    leading hole to pts-dts (sub-frame); the sidecar .srt is rebased by the same
-    value, so subtitles stay aligned with the video timeline."""
-    for _pts, dts in kfs:
-        if dts >= t - 1e-3:
-            return max(0.0, dts - 0.001)
-    return t
-
-
-def hms_ms(t: float) -> str:
-    """HH:MM:SS.mmm (ffmpeg-editlist's seconds() and ffmpeg -ss both accept this)."""
-    t = max(0.0, float(t))
-    h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
-    return f"{h:02d}:{m:02d}:{s:06.3f}"
-
-
-def hms_to_sec(s: str) -> float:
-    h, m, rest = s.split(":")
-    return int(h) * 3600 + int(m) * 60 + float(rest)
-
-
 def probe_output_timeline(mp4: Path) -> tuple[dict[str, float], float]:
     """Per-codec start_time of an output mp4 + video stream duration."""
     out = subprocess.run(
@@ -887,12 +860,52 @@ def srt_ts(t: float) -> str:
     return f"{h:02d}:{m:02d}:{s:06.3f}".replace(".", ",")
 
 
+_SRT_TIME = re.compile(r"(-?\d+):(\d{2}):(\d{2})[,.](\d{1,3})")
+_SRT_CUE = re.compile(
+    r"(-?\d+:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(-?\d+:\d{2}:\d{2}[,.]\d{1,3})")
+
+
+def srt_seconds(stamp: str) -> float:
+    m = _SRT_TIME.search(stamp)
+    if not m:
+        raise ValueError(f"not an SRT timestamp: {stamp!r}")
+    h, mi, s, ms = m.groups()
+    sign = -1.0 if h.startswith("-") else 1.0
+    return sign * (abs(int(h)) * 3600 + int(mi) * 60 + int(s) + int(ms.ljust(3, "0")[:3]) / 1000.0)
+
+
+def parse_srt(path: Path) -> list[dict]:
+    """Cues of an SRT file as [{start, end, text}] (seconds), tolerant of BOM, CRLF
+    and blank lines. Cues whose timing line cannot be parsed are skipped."""
+    cues: list[dict] = []
+    text = path.read_text(encoding="utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+    for block in re.split(r"\n\s*\n", text.strip()):
+        lines = block.strip().split("\n")
+        for i, line in enumerate(lines):
+            m = _SRT_CUE.search(line)
+            if not m:
+                continue
+            try:
+                start, end = srt_seconds(m.group(1)), srt_seconds(m.group(2))
+            except ValueError:
+                break
+            body = " ".join(part.strip() for part in lines[i + 1:]).strip()
+            cues.append({"start": start, "end": end, "text": body})
+            break
+    return cues
+
+
+def compose_srt(cues: list[dict]) -> str:
+    """SRT text for [{start, end, text}]; identical formatting to write_srt()."""
+    blocks = []
+    for i, c in enumerate(cues, 1):
+        text = re.sub(r"\s+", " ", c["text"]).strip()
+        blocks.append(f"{i}\n{srt_ts(c['start'])} --> {srt_ts(c['end'])}\n{text}\n")
+    return "\n".join(blocks)
+
+
 def write_srt(segments: list[dict], path: Path) -> None:
-    lines = []
-    for i, s in enumerate(segments, 1):
-        text = re.sub(r"\s+", " ", s["text"]).strip()
-        lines.append(f"{i}\n{srt_ts(s['start'])} --> {srt_ts(s['end'])}\n{text}\n")
-    path.write_text("\n".join(lines))
+    path.write_text(compose_srt(segments))
 
 
 def write_stage_json(path: Path, data: dict) -> None:
@@ -1215,7 +1228,7 @@ def step_transcribe(workdir: Path, model: str, language: str | None,
         segments = all_segments
     # Drop degenerate segments (end <= start): the transcription API occasionally
     # returns zero-duration duplicates, which are invalid SRT cues and make the
-    # srt parser in ffmpeg-editlist log a skip per cue on every edit run.
+    # srt parser log a skip per cue on every edit run.
     kept = [s for s in segments if float(s["end"]) > float(s["start"])]
     if len(kept) != len(segments):
         log(f"transcribe: dropped {len(segments) - len(kept)} degenerate segment(s) with end <= start")
@@ -1744,7 +1757,7 @@ def validate_segments(data: dict, duration: float) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Stage 4: intermediate format -> ffmpeg-editlist YAML -> apply
+# Stage 4: intermediate format -> keyframe-aligned cuts -> apply
 # --------------------------------------------------------------------------- #
 
 def slugify(s: str, maxlen: int = 60) -> str:
@@ -1757,62 +1770,399 @@ def hms(t: float) -> str:
     return fmt_hms(float(t))
 
 
-def build_editlist_yaml(data: dict, combined: bool, keyframes: list[list[float]] | None = None) -> list[dict]:
-    """Convert segments.json (segments>sections) to an ffmpeg-editlist YAML list.
+def ranges_for_segment(seg: dict, keyframes: list[list[float]] | None = None
+                       ) -> list[tuple[float, float]]:
+    """Non-break section ranges of one segment, as (start, stop) in raw-video seconds.
 
-    One output per segment (icebreaker/episode), containing only non-break
-    sections. Optionally one combined output with all breaks removed.
-
-    If `keyframes` is given, every range start is snapped to the keyframe a
-    stream-copied cut would actually start at (see snap_to_keyframe), so the actual
-    video timeline matches the nominal timeline the sidecar .srt is rebased onto.
-    Times are emitted with millisecond precision (hms_ms).
+    With `keyframes`, each start is moved to the nearest keyframe that is still before
+    the range's stop -- a stream-copied cut can only begin on a keyframe, so the
+    request has to move somewhere, and the distance is logged so a large move (a
+    boundary the segmenter placed badly) is visible.
     """
-    # NOTE: ffmpeg-editlist calls mkvpropedit whenever an entry has title/description
-    # or TOC entries, and mkvpropedit cannot edit .mp4 files. Since our outputs are
-    # .mp4, we emit bare start/stop editlists here and write chapters ourselves.
-    doc: list[dict] = [{"input": "raw.mp4"}]
+    out: list[tuple[float, float]] = []
+    for sec in seg["sections"]:
+        if sec["kind"] == "break":
+            continue
+        s, e = snap_range_start(float(sec["start"]), float(sec["end"]), keyframes)
+        if e > s:
+            out.append((s, e))
+    if not out:
+        s, e = snap_range_start(float(seg["start"]), float(seg["end"]), keyframes)
+        if e > s:
+            out.append((s, e))
+    return out
 
-    def ranges_for(seg: dict) -> list[tuple[float, float, str]]:
-        out = []
-        for sec in seg["sections"]:
-            if sec["kind"] == "break":
-                continue
-            s, e = float(sec["start"]), float(sec["end"])
-            if keyframes:
-                snapped = snap_to_keyframe(s, keyframes)
-                if snapped < e:  # keep degenerate tiny sections unsnapped
-                    s = snapped
-            out.append((s, e, sec.get("title", "")))
-        if not out:
-            out = [(seg["start"], seg["end"], seg.get("title", ""))]
-        return out
 
+def snap_range_start(s: float, e: float, keyframes: list[list[float]] | None
+                     ) -> tuple[float, float]:
+    """Move a range start onto a keyframe that still leaves a non-empty range."""
+    if not keyframes:
+        return s, e
+    usable = [kf[0] for kf in keyframes if 0 <= kf[0] < e]
+    if not usable:
+        return s, e
+    snapped = min(usable, key=lambda pts: abs(pts - s))
+    if abs(snapped - s) > 2.0:
+        log(f"edit: range start {s:.1f}s moved to the nearest keyframe {snapped:.1f}s "
+            f"({snapped - s:+.1f}s)")
+    return snapped, e
+
+
+def build_output_ranges(data: dict, combined: bool,
+                        keyframes: list[list[float]] | None = None) -> list[dict]:
+    """One output per segment (only its non-break sections), plus optionally one
+    combined output with every break removed."""
+    outputs = []
+    every_range: list[tuple[float, float]] = []
     for seg_idx, seg in enumerate(segments_of(data), 1):
-        name = f"{seg_idx:02d}-{slugify(seg.get('title', seg['kind']))}.mp4"
-        entry = {"output": name, "editlist": []}
-        for (s, e, _title) in ranges_for(seg):
-            entry["editlist"].append({"start": hms_ms(s)})
-            entry["editlist"].append({"stop": hms_ms(e)})
-        doc.append(entry)
-
+        ranges = ranges_for_segment(seg, keyframes)
+        outputs.append({
+            "output": f"{seg_idx:02d}-{slugify(seg.get('title', seg['kind']))}.mp4",
+            "ranges": ranges,
+        })
+        every_range.extend(ranges)
     if combined:
-        entry = {"output": "full-nobreaks.mp4", "editlist": []}
-        all_ranges = []
-        for seg in segments_of(data):
-            all_ranges.extend(ranges_for(seg))
-        all_ranges.sort()
-        merged: list[list] = []
-        for s, e, _title in all_ranges:
+        merged: list[list[float]] = []
+        for s, e in sorted(every_range):
             if merged and s <= merged[-1][1] + 1:
                 merged[-1][1] = max(merged[-1][1], e)
             else:
                 merged.append([s, e])
-        for s, e in merged:
-            entry["editlist"].append({"start": hms_ms(s)})
-            entry["editlist"].append({"stop": hms_ms(e)})
-        doc.append(entry)
-    return doc
+        outputs.append({"output": "full-nobreaks.mp4",
+                        "ranges": [(s, e) for s, e in merged]})
+    return outputs
+
+
+def render_ranges(workdir: Path, out: Path, ranges: list[tuple[float, float]],
+                  reencode: bool) -> list[tuple[float, float]]:
+    """Write `out` as the concatenation of `ranges` cut from raw.mp4.
+
+    Returns the ranges actually cut: with stream copy each start is rounded up to the
+    millisecond of its keyframe PTS, which is what the .srt rebasing must use. Nothing
+    else is shifted, so the output timeline is exactly the running sum of the cut
+    durations and does not accumulate drift from range to range.
+    """
+    raw_mp4 = workdir / "raw.mp4"
+    tmpdir = workdir / "edit-tmp"
+    tmpdir.mkdir(exist_ok=True)
+    parts: list[Path] = []
+    cut: list[tuple[float, float]] = []
+    for i, (start, stop) in enumerate(ranges):
+        # Round up so `-ss` can never fall a hair below the keyframe PTS, which would
+        # make ffmpeg seek to the *previous* keyframe and include a whole GOP.
+        s = math.ceil(start * 1000) / 1000
+        e = math.ceil(stop * 1000) / 1000
+        part = tmpdir / f"{out.stem}-{i:03d}.mp4"
+        cut_range(raw_mp4, s, e, part, reencode)
+        parts.append(part)
+        cut.append((s, e))
+    if len(parts) == 1:
+        shutil.move(str(parts[0]), str(out))
+    else:
+        concat_mp4(parts, [e - s for s, e in cut], out, workdir, out.stem)
+    for part in parts:
+        part.unlink(missing_ok=True)
+    return cut
+
+
+def cut_range(raw_mp4: Path, start: float, stop: float, out: Path,
+              reencode: bool) -> None:
+    """Cut one range to its own file.
+
+    Stream copy seeks with `-ss` as an *input* option, which lands exactly on the
+    keyframe at or before `start` (ffmpeg-editlist used an output `-ss` instead, which
+    drops packets until the *next* keyframe and so loses up to a GOP of content at
+    every cut). Re-encoding seeks frame-accurately, so no keyframe is needed at all.
+    """
+    cmd = [which_or_die("ffmpeg"), "-y", "-loglevel", "error",
+           "-ss", f"{start:.3f}", "-to", f"{stop:.3f}", "-i", str(raw_mp4),
+           "-map", "0:v:0", "-map", "0:a:0?"]
+    if reencode:
+        cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                "-c:a", "aac", "-b:a", "160k"]
+    else:
+        cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
+    run(cmd + [str(out)])
+
+
+def concat_mp4(parts: list[Path], durations: list[float], out: Path,
+               workdir: Path, tag: str) -> None:
+    """Concatenate cut parts without re-encoding, at exactly the given offsets.
+
+    The concat demuxer otherwise advances by each file's *container* duration, which
+    is the longer of its audio and video tracks. Because a stream-copied part's audio
+    and video end up to a frame apart, every join then pushed the audio ahead of the
+    video and ahead of the timeline the .srt was rebased onto (55ms per join on
+    day-2, 260ms over four joins, and it grows with the number of cuts). Declaring
+    `duration` explicitly makes the demuxer advance by exactly the cut length and
+    offsets both tracks by the same amount, so picture, sound and subtitles stay on
+    one timeline.
+    """
+    listfile = workdir / f"concat-{slugify(tag)}.txt"
+    listfile.write_text("".join(
+        f"file '{p.resolve()}'\nduration {d:.3f}\n" for p, d in zip(parts, durations)))
+    run([which_or_die("ffmpeg"), "-y", "-loglevel", "error", "-f", "concat",
+         "-safe", "0", "-i", str(listfile), "-fflags", "+igndts",
+         "-c", "copy", str(out)])
+    listfile.unlink(missing_ok=True)
+
+
+def rebase_srt(raw_cues: list[dict], ranges: list[tuple[float, float]],
+               path: Path) -> None:
+    """Map cues from raw-video time onto the timeline `ranges` produces.
+
+    Cues are clipped to each range, so a cue crossing a cut is split and then merged
+    back together on the output timeline (rather than being emitted twice, as
+    ffmpeg-editlist did). Anything inside a removed break disappears.
+    """
+    cums: list[float] = []
+    c = 0.0
+    for s, e in ranges:
+        cums.append(c)
+        c += e - s
+    pieces: list[dict] = []
+    for idx, (s, e) in enumerate(ranges):
+        off = s - cums[idx]
+        for ci, cue in enumerate(raw_cues):
+            lo, hi = max(cue["start"], s), min(cue["end"], e)
+            if hi <= lo:
+                continue
+            pieces.append({"start": lo - off, "end": hi - off,
+                           "text": cue["text"], "_src": ci})
+    merged: list[dict] = []
+    for piece in pieces:
+        prev = merged[-1] if merged else None
+        if (prev is not None and prev["_src"] == piece["_src"]
+                and piece["start"] - prev["end"] <= 0.002):
+            prev["end"] = max(prev["end"], piece["end"])
+            continue
+        merged.append(piece)
+    for cue in merged:
+        del cue["_src"]
+    write_srt(merged, path)
+
+
+ALIGN_AUDIO_BLOCK = 0.01        # seconds per envelope block (~100 Hz correlation)
+ALIGN_AUDIO_WINDOW = 20.0       # audio compared per sample point
+ALIGN_FRAME_WIDTH, ALIGN_FRAME_HEIGHT = 64, 36
+ALIGN_FRAME_FPS = 4.0           # video search grid
+ALIGN_BURST_SECONDS = 1.0       # consecutive frames compared at each candidate
+ALIGN_AUDIO_MIN_PEAK = 0.5      # normalised correlation needed to trust an audio lag
+ALIGN_VIDEO_MAX_RMSE = 24.0     # mean |delta| in grey levels needed to trust a frame
+
+
+def _read_wav_mono(mp4: Path, start: float, dur: float, tmp: Path) -> array.array:
+    """Decode a short window of an mp4's audio to 8 kHz mono int16 samples."""
+    run([which_or_die("ffmpeg"), "-y", "-loglevel", "error",
+         "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", str(mp4),
+         "-vn", "-ac", "1", "-ar", "8000", "-f", "wav", str(tmp)])
+    with wave.open(str(tmp)) as w:
+        return array.array("h", w.readframes(w.getnframes()))
+
+
+def _envelope(samples: array.array, block_seconds: float = ALIGN_AUDIO_BLOCK,
+              rate: int = 8000) -> list[float]:
+    """Block RMS of the signal, i.e. its loudness envelope."""
+    n = max(1, int(block_seconds * rate))
+    out = []
+    for i in range(0, len(samples) - n + 1, n):
+        chunk = samples[i:i + n]
+        out.append(math.sqrt(sum(v * v for v in chunk) / n))
+    return out
+
+
+def normalized_correlation(a: list[float], b: list[float], max_offset: int) -> tuple[int, float]:
+    """Best offset of window `a` inside (the longer) window `b`, with its normalised
+    correlation. Equivalent to taking the cross-correlation and dividing by the energy
+    of the overlapping part, so a loud passage cannot win by sheer amplitude."""
+    best_k, best_v = 0, 0.0
+    span = min(max_offset, len(b) - len(a))
+    mean_a = sum(a) / len(a) if a else 0.0
+    da = [v - mean_a for v in a]
+    energy_a = math.sqrt(sum(v * v for v in da)) or 1.0
+    for k in range(max(0, span) + 1):
+        seg = b[k:k + len(a)]
+        mean_b = sum(seg) / len(seg)
+        db = [v - mean_b for v in seg]
+        energy_b = math.sqrt(sum(v * v for v in db))
+        if energy_b == 0:
+            continue
+        v = sum(x * y for x, y in zip(da, db)) / (energy_a * energy_b)
+        if v > best_v:
+            best_k, best_v = k, v
+    return best_k, best_v
+
+
+def _read_gray_frames(mp4: Path, start: float, dur: float, fps: float) -> list[bytes]:
+    """Decode downscaled greyscale frames of a window, one per 1/fps second."""
+    proc = subprocess.run(
+        [which_or_die("ffmpeg"), "-hide_banner", "-loglevel", "error",
+         "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", str(mp4),
+         "-vf", f"scale={ALIGN_FRAME_WIDTH}:{ALIGN_FRAME_HEIGHT},fps={fps}",
+         "-pix_fmt", "gray", "-f", "rawvideo", "-"],
+        capture_output=True)
+    size = ALIGN_FRAME_WIDTH * ALIGN_FRAME_HEIGHT
+    data = proc.stdout
+    return [data[i:i + size] for i in range(0, len(data) - size + 1, size)]
+
+
+def frame_rmse(a: bytes, b: bytes) -> float:
+    """Mean absolute difference of two greyscale frames, in grey levels (0-255)."""
+    n = min(len(a), len(b))
+    if n == 0:
+        return 255.0
+    return sum(abs(a[i] - b[i]) for i in range(n)) / n
+
+
+def expected_raw_time(t: float, ranges: list[tuple[float, float]]) -> float:
+    """Where the timeline the cut ranges define says output time `t` came from."""
+    cum = 0.0
+    for s, e in ranges:
+        if t < cum + (e - s):   # half-open: t exactly on a join belongs to the next
+            return s + (t - cum)
+        cum += e - s
+    return ranges[-1][0] + (t - cum) if ranges else t
+
+
+def measure_alignment(out_mp4: Path, raw_mp4: Path, ranges: list[tuple[float, float]],
+                      samples: int, search: float, tmpdir: Path) -> list[dict]:
+    """Measure, at `samples` points, how far the output's real content sits from the
+    timeline its .srt was rebased onto.
+
+    Audio is matched by cross-correlating the loudness envelope against raw.mp4, which
+    pins the lag to the 10ms envelope block; video is matched by comparing a
+    downscaled greyscale frame against raw frames on a 1/fps grid across ±`search`.
+    The two are measured independently so a picture/sound divergence cannot hide.
+    """
+    duration = probe_duration(out_mp4)
+    results: list[dict] = []
+    usable = [t for t in (duration * (i + 0.5) / samples for i in range(samples))
+              if t > ALIGN_AUDIO_WINDOW / 2 and t < duration - ALIGN_AUDIO_WINDOW / 2]
+    wav = tmpdir / "align.wav"
+    span = 2 * search + ALIGN_AUDIO_WINDOW
+    for t in usable:
+        exp = expected_raw_time(t, ranges)
+        row = {"t": t, "expected_raw": exp, "audio": None, "video": None,
+               "audio_peak": 0.0, "video_rmse": None}
+        try:
+            here = _envelope(_read_wav_mono(out_mp4, t - ALIGN_AUDIO_WINDOW / 2,
+                                            ALIGN_AUDIO_WINDOW, wav))
+            there = _envelope(_read_wav_mono(raw_mp4, exp - search - ALIGN_AUDIO_WINDOW / 2,
+                                             span, wav))
+            if here and there and len(there) > len(here):
+                k, peak = normalized_correlation(here, there, len(there) - len(here))
+                row["audio_peak"] = peak
+                if peak >= ALIGN_AUDIO_MIN_PEAK:
+                    # `here` starts at t - window/2, `there` at exp - search - window/2,
+                    # so matching block k puts the content at exp - search + k*block.
+                    row["audio"] = k * ALIGN_AUDIO_BLOCK - search
+        except (OSError, subprocess.SubprocessError, wave.Error):
+            pass
+        try:
+            # Compare a short burst, not a single frame: a screen recording is often
+            # nearly identical from one second to the next, so one frame cannot say
+            # where it came from but a few consecutive ones usually can.
+            span_frames = max(1, int(round(ALIGN_BURST_SECONDS * ALIGN_FRAME_FPS)))
+            target = _read_gray_frames(out_mp4, t, span_frames / ALIGN_FRAME_FPS,
+                                       ALIGN_FRAME_FPS)
+            candidates = _read_gray_frames(
+                raw_mp4, exp - search,
+                (2 * search) + span_frames / ALIGN_FRAME_FPS, ALIGN_FRAME_FPS)
+            if len(target) >= span_frames and len(candidates) >= span_frames:
+                burst = target[:span_frames]
+                scores = [sum(frame_rmse(burst[j], candidates[i + j])
+                              for j in range(span_frames)) / span_frames
+                          for i in range(len(candidates) - span_frames + 1)]
+                order = sorted(range(len(scores)), key=lambda i: scores[i])
+                best = order[0]
+                runner_up = scores[order[1]] if len(order) > 1 else 1e9
+                row["video_rmse"] = scores[best]
+                # Only trust the match when it clearly beats every other candidate:
+                # on a static slide every offset scores the same, so the "best" one
+                # would be arbitrary.
+                clear = scores[best] * 1.5 < runner_up
+                if scores[best] > ALIGN_VIDEO_MAX_RMSE:
+                    row["video_note"] = "no match"
+                elif clear:
+                    row["video"] = (best / ALIGN_FRAME_FPS) - search
+                else:
+                    row["video_note"] = "ambiguous"   # e.g. a static slide
+        except (OSError, subprocess.SubprocessError):
+            pass
+        results.append(row)
+    return results
+
+
+def shift_cues(cues: list[dict], samples: list[dict]) -> list[dict]:
+    """Shift cues by the measured lag, interpolated between sample points.
+
+    A cue is moved by -lag: if the output's content at time t comes from raw
+    expected(t) + lag, then speech the cue describes at raw expected(t) is really
+    heard at t - lag. Samples whose measurement was rejected are dropped, so a short
+    output with only one good sample still gets a constant shift.
+    """
+    good = sorted((s for s in samples if s["audio"] is not None), key=lambda s: s["t"])
+    if not good:
+        return []
+    times = [g["t"] for g in good]
+    lags = [g["audio"] for g in good]
+
+    def lag_at(t: float) -> float:
+        if t <= times[0]:
+            return lags[0]
+        if t >= times[-1]:
+            return lags[-1]
+        for i in range(1, len(times)):
+            if t <= times[i]:
+                span = times[i] - times[i - 1]
+                f = 0.0 if span <= 0 else (t - times[i - 1]) / span
+                return lags[i - 1] + f * (lags[i] - lags[i - 1])
+        return lags[-1]
+
+    moved = []
+    for cue in cues:
+        start = max(0.0, cue["start"] - lag_at(cue["start"]))
+        end = max(start, cue["end"] - lag_at(cue["end"]))
+        moved.append({"start": start, "end": end, "text": cue["text"]})
+    return moved
+
+
+def align_output(out_mp4: Path, raw_mp4: Path, ranges: list[tuple[float, float]],
+                 samples: int, search: float, repair: bool, tmpdir: Path,
+                 report: list[str]) -> float:
+    """Measure one output's alignment, optionally repair its .srt, and report.
+
+    Returns the worst measured lag in seconds.
+    """
+    rows = measure_alignment(out_mp4, raw_mp4, ranges, samples, search, tmpdir)
+    audio = [r["audio"] for r in rows if r["audio"] is not None]
+    video = [r["video"] for r in rows if r["video"] is not None]
+    worst = max((abs(v) for v in audio + video), default=0.0)
+    report.append(f"{out_mp4.name}: {len(rows)} sample point(s), "
+                  f"{len(audio)} audio / {len(video)} video measured, "
+                  f"worst lag {worst * 1000:.0f}ms")
+    for r in rows:
+        a = f"{r['audio'] * 1000:+.0f}ms" if r["audio"] is not None else \
+            f"  n/a (peak {r['audio_peak']:.2f})"
+        v = f"{r['video'] * 1000:+.0f}ms" if r["video"] is not None else \
+            f"  n/a ({r.get('video_note', 'unreadable')})"
+        report.append(f"  t={r['t']:8.2f}s raw={r['expected_raw']:9.2f}s "
+                      f"audio {a:>18} video {v:>18}")
+    if not audio:
+        log(f"edit: alignment {out_mp4.name}: no usable audio measurement, "
+            f".srt left alone")
+        return worst
+    if repair:
+        srt = out_mp4.with_suffix(".srt")
+        if srt.exists():
+            cues = parse_srt(srt)
+            shifted = shift_cues(cues, rows)
+            if shifted:
+                write_srt(shifted, srt)
+                report.append(f"  repaired {len(shifted)} cue(s) by the measured lag")
+                log(f"edit: alignment {out_mp4.name}: shifted {len(shifted)} cue(s) "
+                    f"by the measured lag (worst {worst * 1000:.0f}ms)")
+    return worst
 
 
 def write_chapters(data: dict, outdir: Path, day_title: str | None = None) -> None:
@@ -1848,47 +2198,61 @@ def apply_subs(mp4: Path, srt: Path, out: Path, mode: str) -> None:
 
 
 def step_edit(workdir: Path, data: dict, subs: str, reencode: bool, combined: bool,
-              snap_keyframes: bool = True, day_title: str | None = None) -> None:
+              snap_keyframes: bool = True, day_title: str | None = None, *,
+              align_check: bool = True, align_samples: int = 8,
+              align_search_seconds: float = 3.0, align_repair: bool = True) -> None:
     workdir = workdir.resolve()
     outdir = (workdir / "out").resolve()
     outdir.mkdir(exist_ok=True)
+    raw_mp4 = workdir / "raw.mp4"
     kfs: list[list[float]] | None = None
-    if snap_keyframes:
+    # Re-encoding seeks frame-accurately, so there is no reason to round cuts onto
+    # keyframes; only stream copy needs them.
+    if snap_keyframes and not reencode:
         kf_cache = workdir / "keyframes.json"
-        kfs = load_keyframe_cache(kf_cache, workdir / "raw.mp4")
+        kfs = load_keyframe_cache(kf_cache, raw_mp4)
         if kfs is not None:
             log(f"edit: loaded {len(kfs)} keyframes from {kf_cache.name}")
         else:
             log("edit: probing video keyframes of raw.mp4 (cached in keyframes.json)")
-            kfs = probe_keyframes(workdir / "raw.mp4")
-            write_keyframe_cache(kf_cache, workdir / "raw.mp4", kfs)
+            kfs = probe_keyframes(raw_mp4)
+            write_keyframe_cache(kf_cache, raw_mp4, kfs)
             log(f"edit: {len(kfs)} keyframes found")
-    doc = build_editlist_yaml(data, combined=combined, keyframes=kfs)
-    editlist_yaml = workdir / "editlist.yaml"
-    editlist_yaml.write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True))
-    log(f"edit: wrote {editlist_yaml} ({len(doc)-1} outputs"
-        + (", cut points snapped to keyframes)" if kfs else ")"))
-
-    fel = [sys.executable, "-m", "ffmpeg_editlist"]
-    cmd = fel + [str(editlist_yaml), str(workdir), "-o", str(outdir),
-                 "--srt", "--no-mkv-props", "-f"]
-    if reencode:
-        cmd.append("--reencode")
-    run(cmd, cwd=workdir)
+    outputs = build_output_ranges(data, combined, keyframes=kfs)
+    raw_srt = workdir / "raw.srt"
+    raw_cues = parse_srt(raw_srt) if raw_srt.exists() else []
+    if not raw_cues:
+        log("edit: WARNING no cues in raw.srt -- outputs will have no subtitles")
+    log(f"edit: cutting {len(outputs)} output(s) with "
+        + ("a re-encode (frame-accurate cuts)" if reencode
+           else "stream copy" + (", cuts snapped to keyframes)" if kfs else ")")))
+    cut_ranges: dict[str, list[tuple[float, float]]] = {}
+    for entry in outputs:
+        name, ranges = entry["output"], entry["ranges"]
+        if not ranges:
+            log(f"edit: WARNING no non-break ranges for {name}, skipping")
+            continue
+        mp4 = outdir / name
+        cut_ranges[name] = render_ranges(workdir, mp4, ranges, reencode)
+        rebase_srt(raw_cues, cut_ranges[name], mp4.with_suffix(".srt"))
+        log(f"edit: {name}: {len(ranges)} range(s), "
+            f"{probe_duration(mp4):.1f}s, {len(parse_srt(mp4.with_suffix('.srt')))} cues")
+    tmpdir = workdir / "edit-tmp"
+    if tmpdir.exists() and not any(tmpdir.iterdir()):
+        tmpdir.rmdir()
     write_chapters(data, outdir, day_title=day_title)
 
-    # Sync report: verify each output's actual video timeline matches the nominal
-    # editlist timeline that the sidecar .srt was rebased onto.
+    # Sync report: verify each output's actual video timeline matches the timeline
+    # its .srt was rebased onto.
     report = [f"# sync report {time.strftime('%Y-%m-%dT%H:%M:%S')}",
-              "# drift = actual video range start - nominal (cumulative) editlist start"]
-    for entry in doc[1:]:
-        mp4 = outdir / entry["output"]
-        if not mp4.exists():
+              "# drift = actual video range start - cumulative cut duration"]
+    for entry in outputs:
+        name = entry["output"]
+        mp4 = outdir / name
+        if name not in cut_ranges or not mp4.exists():
             log(f"edit: WARNING output missing: {mp4}")
             continue
-        el = entry["editlist"]
-        ranges = [(hms_to_sec(el[i]["start"]), hms_to_sec(el[i + 1]["stop"]))
-                  for i in range(0, len(el) - 1, 2)]
+        ranges = cut_ranges[name]
         cums: list[float] = []
         c = 0.0
         for s, e in ranges:
@@ -1901,32 +2265,55 @@ def step_edit(workdir: Path, data: dict, subs: str, reencode: bool, combined: bo
         first_cue = srt_first_cue(srt) if srt.exists() else float("nan")
         max_drift = max((abs(s) for s in shifts), default=0.0)
         report.append(
-            f"{entry['output']}: video_start={starts.get('video', 0.0):.3f} "
+            f"{name}: video_start={starts.get('video', 0.0):.3f} "
             f"audio_start={starts.get('audio', 0.0):.3f} srt_first={first_cue:.3f} "
             f"ranges={len(ranges)} max_drift={max_drift * 1000:.0f}ms")
-        for i, (cum, act) in enumerate(zip(cums, actual)):
+        for i, (act, cum) in enumerate(zip(actual, cums)):
             report.append(f"  range {i + 1}: nominal {cum:.3f} -> actual {act:.3f} "
                           f"(drift {shifts[i] * 1000:+.0f} ms)")
         if max_drift > 0.5:
-            log(f"edit: WARNING sync drift {max_drift * 1000:.0f} ms in {mp4.name} "
+            log(f"edit: WARNING sync drift {max_drift * 1000:.0f} ms in {name} "
                 f"(see {outdir / 'sync-report.txt'})")
         else:
-            log(f"edit: sync ok {mp4.name}: max drift {max_drift * 1000:.0f} ms "
+            log(f"edit: sync ok {name}: max drift {max_drift * 1000:.0f} ms "
                 f"over {len(ranges)} range(s)")
     (outdir / "sync-report.txt").write_text("\n".join(report) + "\n")
     log(f"edit: sync report -> {outdir / 'sync-report.txt'}")
 
-    # ffmpeg-editlist leaves .srt sidecars (we passed --no-mkv-props because the
-    # outputs are .mp4); mux them into the mp4s now.
-    for entry in doc[1:]:
-        mp4 = outdir / entry["output"]
+    if align_check:
+        align_report = [f"# alignment report {time.strftime('%Y-%m-%dT%H:%M:%S')}",
+                        "# lag = (where the output's content really comes from) minus",
+                        "#       (where the cut ranges say it should come from); the .srt is",
+                        "#       shifted by the measured lag so it sits on the speech"]
+        worst_overall = 0.0
+        for entry in outputs:
+            name = entry["output"]
+            mp4 = outdir / name
+            if name not in cut_ranges or not mp4.exists():
+                continue
+            worst_overall = max(worst_overall,
+                                align_output(mp4, raw_mp4, cut_ranges[name],
+                                             align_samples, align_search_seconds,
+                                             align_repair, workdir, align_report))
+        (outdir / "align-report.txt").write_text("\n".join(align_report) + "\n")
+        report.extend(["", "# measured alignment (see align-report.txt)"] + align_report)
+        (outdir / "sync-report.txt").write_text("\n".join(report) + "\n")
+        log(f"edit: align report -> {outdir / 'align-report.txt'} "
+            f"(worst lag {worst_overall * 1000:.0f}ms)")
+    else:
+        log("edit: alignment pass disabled (--no-align-check)")
+
+    # Mux/burn the sidecar .srt into each output.
+    for entry in outputs:
+        name = entry["output"]
+        mp4 = outdir / name
         srt = mp4.with_suffix(".srt")
         if not mp4.exists():
             log(f"edit: WARNING output missing: {mp4}")
             continue
         if subs == "sidecar":
             continue
-        final = outdir / ("subs-" + entry["output"]) if subs == "embed" else outdir / entry["output"]
+        final = outdir / ("subs-" + name) if subs == "embed" else outdir / name
         if srt.exists():
             tmp_out = final.with_suffix(".tmp.mp4")
             apply_subs(mp4, srt, tmp_out, subs)
@@ -1937,10 +2324,9 @@ def step_edit(workdir: Path, data: dict, subs: str, reencode: bool, combined: bo
                 shutil.move(str(tmp_out), str(final))
             log(f"edit: subtitles {subs} -> {final.name}")
         elif subs != "sidecar":
-            log(f"edit: WARNING no srt for {mp4.name}, copying as-is")
+            log(f"edit: WARNING no srt for {name}, copying as-is")
 
     # original mp4 with subtitles applied
-    raw_mp4 = workdir / "raw.mp4"
     raw_srt = workdir / "raw.srt"
     if subs == "embed":
         apply_subs(raw_mp4, raw_srt, outdir / "original-with-subs.mp4", "embed")
@@ -2062,7 +2448,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--subs", choices=["embed", "burn", "sidecar"], default=None,
                     help="how to apply subtitles to outputs (default: embed as mov_text)")
     ap.add_argument("--reencode", action="store_true", default=None,
-                    help="re-encode segments in ffmpeg-editlist (seamless cuts, slower)")
+                    help="re-encode instead of stream-copying the cuts (frame-accurate cut "
+                         "points and seamless joins, much slower)")
     ap.add_argument("--no-combined", action="store_true", default=None,
                     help="do not emit the combined full-nobreaks.mp4 output")
     ap.add_argument("--pi-bin", default=None)
@@ -2321,7 +2708,10 @@ def run_pipeline(opt: dict, source: dict, day_title: str | None,
         log("edit: .edit-done marker exists, skipping (use --force-edit to redo)")
     else:
         step_edit(workdir, data, opt["subs"], opt["reencode"], combined=not opt["no_combined"],
-                  snap_keyframes=not opt["no_snap_keyframes"], day_title=day_title)
+                  snap_keyframes=not opt["no_snap_keyframes"], day_title=day_title,
+                  align_check=opt["align_check"], align_samples=opt["align_samples"],
+                  align_search_seconds=opt["align_search_seconds"],
+                  align_repair=opt["align_repair"])
     log(f"DONE. Outputs in {(workdir / 'out').resolve()}")
 
 

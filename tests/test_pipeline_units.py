@@ -284,6 +284,164 @@ class IntervalMathTests(unittest.TestCase):
         self.assertEqual(pipeline._intervals_union([[5, 5], [7, 3]]), [])
 
 
+class SrtTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+
+    def test_compose_parse_roundtrip(self):
+        path = self.dir / "a.srt"
+        cues = [{"start": 0.0, "end": 4.4, "text": "Hello, hello."},
+                {"start": 5.64, "end": 8.54, "text": "So you've been  active."}]
+        pipeline.write_srt(cues, path)
+        self.assertEqual(pipeline.parse_srt(path),
+                         [{"start": 0.0, "end": 4.4, "text": "Hello, hello."},
+                          {"start": 5.64, "end": 8.54, "text": "So you've been active."}])
+
+    def test_parse_tolerates_bom_crlf_and_junk(self):
+        path = self.dir / "b.srt"
+        path.write_bytes("\ufeff1\r\n00:00:01,000 --> 00:00:02,500\r\nhi\r\n\r\n"
+                         "not a cue\r\n\r\n"
+                         "2\r\n00:00:03.000 --> 00:00:04.000\r\nthere\r\n".encode("utf-8"))
+        self.assertEqual([c["text"] for c in pipeline.parse_srt(path)], ["hi", "there"])
+
+    def test_srt_seconds_handles_missing_short_ms(self):
+        self.assertAlmostEqual(pipeline.srt_seconds("00:00:01,5"), 1.5)
+        self.assertAlmostEqual(pipeline.srt_seconds("01:02:03,250"), 3723.25)
+
+
+class RebaseSrtTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+
+    def rebase(self, cues, ranges):
+        out = self.dir / "o.srt"
+        pipeline.rebase_srt(cues, ranges, out)
+        return pipeline.parse_srt(out)
+
+    def test_offsets_follow_the_range_starts(self):
+        cues = [{"start": 100.0, "end": 104.0, "text": "a"},
+                {"start": 210.0, "end": 214.0, "text": "b"}]
+        out = self.rebase(cues, [(100.0, 200.0), (210.0, 300.0)])
+        self.assertAlmostEqual(out[0]["start"], 0.0, places=6)
+        # second range starts at output 100s and is 100s long
+        self.assertAlmostEqual(out[1]["start"], 100.0, places=6)
+
+    def test_content_in_a_removed_break_disappears(self):
+        cues = [{"start": 100.0, "end": 104.0, "text": "a"},
+                {"start": 250.0, "end": 254.0, "text": "break talk"},
+                {"start": 310.0, "end": 314.0, "text": "b"}]
+        out = self.rebase(cues, [(100.0, 200.0), (300.0, 400.0)])
+        self.assertEqual([c["text"] for c in out], ["a", "b"])
+
+    def test_cue_crossing_a_cut_is_split_then_merged_not_duplicated(self):
+        cues = [{"start": 198.0, "end": 202.0, "text": "spanning"}]
+        out = self.rebase(cues, [(100.0, 200.0), (200.0, 300.0)])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["text"], "spanning")
+        self.assertAlmostEqual(out[0]["start"], 98.0, places=6)
+        self.assertAlmostEqual(out[0]["end"], 102.0, places=6)
+
+
+class SnapRangeTests(unittest.TestCase):
+    KFS = [[0.0, -0.033], [10.1, 10.0], [20.2, 20.1]]
+
+    def test_nearest_keyframe_and_keyframe_list_not_required(self):
+        self.assertEqual(pipeline.snap_range_start(9.0, 30.0, self.KFS)[0], 10.1)
+        self.assertEqual(pipeline.snap_range_start(11.0, 30.0, self.KFS)[0], 10.1)
+        self.assertEqual(pipeline.snap_range_start(9.0, 30.0, None), (9.0, 30.0))
+
+    def test_section_inside_one_gop_snaps_to_that_gop(self):
+        # A stream-copied cut at 19.0 lands on the 10.1 keyframe anyway, so report
+        # 10.1: pretending the cut starts at 19.0 would misplace every subtitle after
+        # it. The resulting output is longer than the section, which stream copy
+        # cannot avoid.
+        self.assertEqual(pipeline.snap_range_start(19.0, 19.5, self.KFS), (10.1, 19.5))
+
+
+class ExpectedRawTimeTests(unittest.TestCase):
+    def test_maps_across_ranges(self):
+        ranges = [(100.0, 200.0), (300.0, 400.0)]
+        self.assertAlmostEqual(pipeline.expected_raw_time(0.0, ranges), 100.0)
+        self.assertAlmostEqual(pipeline.expected_raw_time(50.0, ranges), 150.0)
+        self.assertAlmostEqual(pipeline.expected_raw_time(100.0, ranges), 300.0)
+        self.assertAlmostEqual(pipeline.expected_raw_time(150.0, ranges), 350.0)
+
+
+class ShiftCuesTests(unittest.TestCase):
+    def test_constant_lag_shifts_every_cue(self):
+        samples = [{"t": 0.0, "audio": 0.5}, {"t": 100.0, "audio": 0.5}]
+        out = pipeline.shift_cues([{"start": 10.0, "end": 20.0, "text": "x"}], samples)
+        self.assertAlmostEqual(out[0]["start"], 9.5, places=6)
+        self.assertAlmostEqual(out[0]["end"], 19.5, places=6)
+
+    def test_lag_is_interpolated_between_samples(self):
+        samples = [{"t": 0.0, "audio": 0.0}, {"t": 100.0, "audio": 2.0}]
+        out = pipeline.shift_cues([{"start": 50.0, "end": 50.0, "text": "x"}], samples)
+        self.assertAlmostEqual(out[0]["start"], 49.0, places=6)
+
+    def test_rejected_samples_are_ignored(self):
+        samples = [{"t": 0.0, "audio": None}, {"t": 100.0, "audio": 1.0}]
+        out = pipeline.shift_cues([{"start": 10.0, "end": 20.0, "text": "x"}], samples)
+        self.assertAlmostEqual(out[0]["start"], 9.0, places=6)
+
+    def test_no_usable_samples_shifts_nothing(self):
+        self.assertEqual(pipeline.shift_cues([{"start": 1.0, "end": 2.0, "text": "x"}],
+                                             [{"t": 0.0, "audio": None}]), [])
+
+    def test_shift_never_produces_a_negative_or_inverted_cue(self):
+        samples = [{"t": 0.0, "audio": 5.0}, {"t": 100.0, "audio": 5.0}]
+        out = pipeline.shift_cues([{"start": 1.0, "end": 1.5, "text": "x"}], samples)
+        self.assertEqual(out[0]["start"], 0.0)
+        self.assertGreaterEqual(out[0]["end"], out[0]["start"])
+
+
+class CorrelationTests(unittest.TestCase):
+    def test_finds_a_known_offset(self):
+        signal = [0.0, 0.0, 1.0, 5.0, 2.0, 0.0, 0.0, 0.0, 0.0]
+        window = [1.0, 5.0, 2.0]
+        b = signal[:2] + window + signal[5:]
+        k, peak = pipeline.normalized_correlation(window, b, len(b) - len(window))
+        self.assertEqual(k, 2)
+        self.assertGreater(peak, 0.99)
+
+    def test_flat_signal_has_no_usable_peak(self):
+        k, peak = pipeline.normalized_correlation([1.0] * 5, [1.0] * 10, 5)
+        self.assertLess(peak, 0.5)
+
+    def test_frame_rmse(self):
+        self.assertAlmostEqual(pipeline.frame_rmse(b"\x00\x10", b"\x00\x10"), 0.0)
+        self.assertAlmostEqual(pipeline.frame_rmse(b"\x00\x00", b"\x0a\x14"), 15.0)
+        self.assertEqual(pipeline.frame_rmse(b"", b""), 255.0)
+
+
+class BuildOutputRangesTests(unittest.TestCase):
+    DATA = {"segments": [
+        {"kind": "episode", "title": "One", "start": 0.0, "end": 100.0,
+         "sections": [{"kind": "content", "title": "c", "start": 0.0, "end": 60.0},
+                      {"kind": "break", "title": "b", "start": 60.0, "end": 80.0},
+                      {"kind": "content", "title": "c2", "start": 80.0, "end": 100.0}]},
+        {"kind": "episode", "title": "Two", "start": 100.0, "end": 200.0,
+         "sections": [{"kind": "content", "title": "c", "start": 100.0, "end": 200.0}]},
+    ]}
+
+    def test_one_output_per_segment_breaks_removed(self):
+        out = pipeline.build_output_ranges(self.DATA, combined=False)
+        self.assertEqual([o["output"] for o in out], ["01-one.mp4", "02-two.mp4"])
+        self.assertEqual(out[0]["ranges"], [(0.0, 60.0), (80.0, 100.0)])
+        self.assertEqual(out[1]["ranges"], [(100.0, 200.0)])
+
+    def test_combined_output_merges_adjacent_ranges(self):
+        out = pipeline.build_output_ranges(self.DATA, combined=True)
+        self.assertEqual(out[-1]["output"], "full-nobreaks.mp4")
+        self.assertEqual(out[-1]["ranges"], [(0.0, 60.0), (80.0, 200.0)])
+
+    def test_keyframes_move_starts(self):
+        kfs = [[0.0, -0.03], [58.0, 57.9], [79.0, 78.9], [100.0, 99.9]]
+        out = pipeline.build_output_ranges(self.DATA, combined=False, keyframes=kfs)
+        self.assertEqual(out[0]["ranges"], [(0.0, 60.0), (79.0, 100.0)])
+        self.assertEqual(out[1]["ranges"], [(100.0, 200.0)])
+
+
 def make_session_jsonl() -> str:
     """A small synthetic pi session (JSONL) with a tool call and two assistant
     messages carrying usage+cost."""
