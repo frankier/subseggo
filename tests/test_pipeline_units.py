@@ -951,6 +951,21 @@ class ClassifyPiFailureTests(unittest.TestCase):
         self.assertEqual(kind, "retryable")
         self.assertIn("5xx", cause)
 
+    def test_server_error_names_the_status_code_and_message(self):
+        # pi records the provider error verbatim: the cause carries the real code
+        # and message, not just "5xx"
+        kind, cause = pipeline.classify_pi_failure(
+            1, 'pi session error(s): Mistral API error (503): {"object":"error",'
+               '"message":"Service unavailable","type":"server_error"}')
+        self.assertEqual(kind, "retryable")
+        self.assertEqual(cause, "API server error (5xx): 503 Service unavailable")
+
+    def test_server_error_falls_back_to_the_reason_phrase(self):
+        kind, cause = pipeline.classify_pi_failure(
+            1, "stderr tail: Error: HTTP 502 Bad Gateway")
+        self.assertEqual(kind, "retryable")
+        self.assertEqual(cause, "API server error (5xx): 502 Bad Gateway")
+
     def test_terminated_is_retryable(self):
         # the incident: pi exited rc=1 with only "terminated" on stderr
         kind, cause = pipeline.classify_pi_failure(1, "stderr tail: terminated")

@@ -1541,11 +1541,43 @@ def save_pi_transcript(workdir: Path, session_scratch: Path, acct: Accounting | 
     return transcript
 
 
+def pi_server_error_detail(diag: str) -> str:
+    """The actual status code and message behind a 5xx match, e.g.
+    '503 Service unavailable', so the retry log and the final error name the real
+    server error instead of just '5xx'. pi records the provider error in its session
+    ('Mistral API error (503): {"object":"error","message":"Service unavailable",...}');
+    when it records only 'Provider stopped with: error (server error)' there is no
+    code to report and this returns ''."""
+    m = re.search(r"\b(5\d\d)\b", diag)
+    if not m:
+        return ""
+    msg = _error_message_after(diag, m.end())
+    return f"{m.group(1)} {msg}" if msg else m.group(1)
+
+
+def _error_message_after(diag: str, pos: int) -> str:
+    """The human message that follows a status code in the diagnostics: the
+    'message' field of a JSON error body, else the reason phrase on the same line
+    ('503 Service Unavailable')."""
+    rest = diag[pos:pos + 2000]
+    brace = rest.find("{")
+    if brace != -1:
+        try:
+            body, _ = json.JSONDecoder().raw_decode(rest[brace:])
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and isinstance(body.get("message"), str):
+            return body["message"][:200]
+    return rest.split("\n", 1)[0].lstrip(" \t:)-").strip()[:200]
+
+
 # Common `pi` oneshot failure causes, matched case-insensitively against the pi
 # process output AND the error messages pi records in its session transcript.
 # Fatal causes (out of money, auth, bad request, ...) are never retried -- the
 # identical request cannot succeed on a retry; everything else is treated as a
-# transient/random failure and retried up to PI_MAX_ATTEMPTS times.
+# transient/random failure and retried up to PI_MAX_ATTEMPTS times. A retryable
+# entry may carry a third element: a function that pulls the concrete detail
+# (the actual status code and message) out of the diagnostics.
 PI_FATAL_CAUSES = [
     (r"payment required|insufficient (balance|credits|funds)|out of (credits|money)|"
      r"credit balance|top[- ]?up your|\b402\b|quota exceeded|insufficient_quota|billing",
@@ -1563,15 +1595,15 @@ PI_FATAL_CAUSES = [
 ]
 PI_RETRYABLE_CAUSES = [
     (r"\b429\b|rate ?limit|too many requests|overloaded",
-     "rate limited / overloaded"),
+     "rate limited / overloaded", None),
     (r"\b5\d\d\b|server error|internal (server )?error|bad gateway|service unavailable|"
      r"gateway timeout|upstream",
-     "API server error (5xx)"),
+     "API server error (5xx)", pi_server_error_detail),
     (r"network|econnreset|econnrefused|etimedout|timed? ?out|timeout|fetch failed|"
      r"socket|dns|eai_again|connection (reset|refused|closed)",
-     "network error"),
+     "network error", None),
     (r"terminated|aborted|interrupted|killed|sigterm|sigint|broken pipe",
-     "run terminated/aborted (killed or cancelled mid-request)"),
+     "run terminated/aborted (killed or cancelled mid-request)", None),
 ]
 
 
@@ -1583,9 +1615,10 @@ def classify_pi_failure(rc: int, diag: str) -> tuple[str, str]:
     for pat, cause in PI_FATAL_CAUSES:
         if re.search(pat, low):
             return "fatal", cause
-    for pat, cause in PI_RETRYABLE_CAUSES:
+    for pat, cause, detail in PI_RETRYABLE_CAUSES:
         if re.search(pat, low):
-            return "retryable", cause
+            extra = detail(diag) if detail else ""
+            return "retryable", f"{cause}: {extra}" if extra else cause
     if rc < 0:
         return "retryable", f"pi process killed by signal {-rc}"
     return "retryable", "unknown/random failure"
