@@ -76,8 +76,8 @@
 ## Why the chunk boundaries follow silence
 
 The subtitles were once badly out of sync, and the cut/mux/`.srt` stage was not the
-cause: measured on a rebuilt output, audio, video and `.srt` agreed within 30 ms.
-The transcription was. A provider's segment timestamps are produced per chunk, so
+cause: measured on rebuilt outputs of that day, audio, video and `.srt` agreed
+within 50 ms. The transcription was. A provider's segment timestamps are produced per chunk, so
 its idea of how quickly time passes inside a chunk is the only thing that can put
 cues minutes away from the speech they belong to — and a long silence inside a
 chunk is where that estimate goes wrong. On one day of a three-day event:
