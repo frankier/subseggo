@@ -93,6 +93,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -901,26 +902,249 @@ def write_stage_json(path: Path, data: dict) -> None:
     tmp.replace(path)
 
 
+class AudioChunk:
+    """One audio range sent to the transcription API.
+
+    `drop_before` is the absolute time before which returned segments belong to the
+    previous chunk's overlap tail; step_transcribe discards them so a phrase spoken
+    inside the overlap is not emitted twice. It equals `start` when this chunk does
+    not overlap its predecessor (which is always the case across a long silence).
+    """
+
+    __slots__ = ("start", "duration", "drop_before")
+
+    def __init__(self, start: float, duration: float, drop_before: float):
+        self.start = float(start)
+        self.duration = float(duration)
+        self.drop_before = float(drop_before)
+
+    @property
+    def end(self) -> float:
+        return self.start + self.duration
+
+    def __repr__(self) -> str:  # keeps log lines short
+        return f"AudioChunk({self.start:.1f}, +{self.duration:.1f})"
+
+
+def _split_region(start: float, end: float, max_seconds: float,
+                  overlap_seconds: float) -> list[AudioChunk]:
+    """Split [start, end] into the fewest equal pieces that fit under `max_seconds`,
+    each overlapping the next by `overlap_seconds`."""
+    length = end - start
+    if length <= max_seconds:
+        return [AudioChunk(start, length, start)]
+    span = max_seconds - overlap_seconds
+    n = max(2, math.ceil((length - overlap_seconds) / span - 1e-9))
+    while (length + (n - 1) * overlap_seconds) / n > max_seconds + 1e-9:
+        n += 1
+    piece = (length + (n - 1) * overlap_seconds) / n
+    step = piece - overlap_seconds
+    chunks = []
+    for i in range(n):
+        s = start + i * step
+        if i == n - 1:      # anchor the tail so rounding cannot overshoot the end
+            s = max(start, end - piece)
+        chunks.append(AudioChunk(s, piece, s + overlap_seconds if i else s))
+    return chunks
+
+
+def build_audio_chunks(duration: float, silences: list[list[float]],
+                       max_seconds: float,
+                       long_silence_seconds: float = DEFAULT_CHUNK_SILENCE_MIN_SECONDS,
+                       overlap_seconds: float = DEFAULT_CHUNK_OVERLAP_SECONDS
+                       ) -> list[AudioChunk]:
+    """Transcription chunks that contain no long silence.
+
+    A transcription provider's segment timestamps are only reliable while the audio
+    is contiguous speech: given a long stretch of silence inside one request they
+    compress or stretch the timeline instead of tracking it, which silently shifts
+    every subtitle after that point. So a chunk starts at the first non-silent
+    moment and stops where the next silence of at least `long_silence_seconds`
+    begins; the following chunk resumes at the end of that silence. The silence is
+    therefore never uploaded, and no chunk straddles one. Shorter pauses stay
+    inside their chunk.
+
+    A contiguous speech region that is still longer than `max_seconds` is split into
+    equal overlapping pieces, since there is no silence to split on.
+    """
+    if duration <= 0:
+        return []
+    long_silences = sorted((max(0.0, s), min(duration, e)) for s, e in silences
+                           if e - s >= long_silence_seconds and e > 0 and s < duration)
+    regions: list[tuple[float, float]] = []
+    pos = 0.0
+    for s, e in long_silences:
+        if s > pos:
+            regions.append((pos, s))
+        pos = max(pos, e)
+    if pos < duration:
+        regions.append((pos, duration))
+    chunks: list[AudioChunk] = []
+    for s, e in regions:
+        if e - s <= 0:
+            continue
+        chunks.extend(_split_region(s, e, max_seconds, overlap_seconds))
+    if not chunks:
+        # everything is silence: still send one chunk so we emit an empty transcript
+        # rather than failing, and let the coverage check report the oddity
+        chunks = [AudioChunk(0.0, duration, 0.0)]
+    return chunks
+
+
+def _intervals_union(intervals: list[list[float]]) -> list[list[float]]:
+    """Merge overlapping/adjacent [start, end] intervals, dropping empty ones."""
+    out: list[list[float]] = []
+    for s, e in sorted(intervals):
+        if e <= s:
+            continue
+        if out and s <= out[-1][1] + 1e-9:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+
+def _intervals_minus(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
+    """a minus b, both lists of disjoint [start, end] intervals."""
+    out: list[list[float]] = []
+    for s, e in a:
+        cur = s
+        for bs, be in b:
+            if be <= cur:
+                continue
+            if bs >= e:
+                break
+            if bs > cur:
+                out.append([cur, min(bs, e)])
+            cur = max(cur, be)
+            if cur >= e:
+                break
+        if cur < e:
+            out.append([cur, e])
+    return out
+
+
+def _intervals_intersect(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
+    out: list[list[float]] = []
+    for s, e in a:
+        for bs, be in b:
+            lo, hi = max(s, bs), min(e, be)
+            if hi > lo:
+                out.append([lo, hi])
+    return _intervals_union(out)
+
+
+def _total_length(intervals: list[list[float]]) -> float:
+    return sum(e - s for s, e in intervals)
+
+
+# Coverage tolerances, calibrated against day-2 (the run whose subtitles were wrong):
+# chunks with a correct transcript scored 0.0-2.3% of cue time on silence, the two
+# drifted chunks 20% and 27%. `spurious` is the signal that discriminates, and it has a
+# clean physical meaning: cue text on audio that is measurably empty. `missed` is
+# reported but not gated on, because a provider rightly emits no cue for non-speech
+# sound (typing, laughter, room tone above the threshold), which would otherwise look
+# like drift. An outright empty transcript is caught separately.
+COVERAGE_SILENCE_MIN_SECONDS = 3.0   # a cue sitting on 3s+ of real silence is an error
+COVERAGE_SPURIOUS_MIN_SECONDS = 5.0
+COVERAGE_SPURIOUS_FRACTION = 0.05
+COVERAGE_EMPTY_SPEECH_SECONDS = 60.0  # this much speech with nothing cued is a failure
+
+
+def chunk_coverage_report(idx: int, part: AudioChunk, raw_segs: list[dict],
+                          silences: list[list[float]]) -> dict:
+    """Compare what one chunk's audio contains with what the provider says is in it.
+
+    Silence-aware chunking stops a provider from drifting across a long silence, but
+    nothing forces it not to drift anyway. This is the cheap check that would have
+    caught the day-2 failure without any forensics: a chunk is contiguous speech by
+    construction, so cue text landing on a detected silence means the timestamps are
+    wrong, and every subtitle after that point is shifted.
+    """
+    lo, hi = part.start, part.end
+    cue = _intervals_union([[max(lo, lo + s["start"]), min(hi, lo + s["end"])]
+                            for s in raw_segs if float(s["end"]) > float(s["start"])])
+    silence = _intervals_union([[max(s, lo), min(e, hi)] for s, e in silences
+                                if e - s >= COVERAGE_SILENCE_MIN_SECONDS])
+    speech = _intervals_minus(
+        [[lo, hi]],
+        _intervals_union([[max(s, lo), min(e, hi)] for s, e in silences]))
+    spurious = _total_length(_intervals_intersect(cue, silence))
+    cue_seconds = _total_length(cue)
+    speech_seconds = _total_length(speech)
+    missed = _total_length(_intervals_minus(speech, cue))
+    missed_fraction = missed / speech_seconds if speech_seconds > 0 else 0.0
+    spurious_fraction = spurious / cue_seconds if cue_seconds > 0 else 0.0
+    too_much_silence = spurious > max(COVERAGE_SPURIOUS_MIN_SECONDS,
+                                      COVERAGE_SPURIOUS_FRACTION * cue_seconds)
+    empty = speech_seconds >= COVERAGE_EMPTY_SPEECH_SECONDS and not cue_seconds
+    return {"chunk": idx, "start": lo, "duration": part.duration,
+            "segments": len(raw_segs), "speech": speech_seconds, "cue": cue_seconds,
+            "spurious": spurious, "spurious_fraction": spurious_fraction,
+            "missed": missed, "missed_fraction": missed_fraction,
+            "ok": not too_much_silence and not empty}
+
+
+def report_chunk_coverage(workdir: Path, coverage: list[dict]) -> None:
+    """Write workdir/transcript-coverage.txt and warn about suspicious chunks."""
+    lines = ["# per-chunk transcript coverage",
+             "# spurious = seconds of cue text sitting on audio detected as silence",
+             f"#            (silences shorter than {COVERAGE_SILENCE_MIN_SECONDS:.0f}s are ignored)",
+             "# missed   = seconds of speech (chunk audio minus detected silence) with no",
+             "#            cue; informational only, since non-speech sound is not cued"]
+    for c in coverage:
+        lines.append(
+            f"chunk {c['chunk']:03d} [{c['start']:.1f}s +{c['duration']:.1f}s]: "
+            f"{c['segments']} segments, speech {c['speech']:.0f}s, cue {c['cue']:.0f}s, "
+            f"spurious {c['spurious']:.0f}s ({c['spurious_fraction'] * 100:.1f}%), "
+            f"missed {c['missed']:.0f}s ({c['missed_fraction'] * 100:.0f}%)"
+            + ("" if c["ok"] else "  <-- SUSPICIOUS"))
+    path = workdir / "transcript-coverage.txt"
+    path.write_text("\n".join(lines) + "\n")
+    bad = [c for c in coverage if not c["ok"]]
+    if bad:
+        log(f"transcribe: WARNING {len(bad)} of {len(coverage)} chunk(s) look misaligned "
+            f"against their own audio -- the provider's segment timestamps do not match "
+            f"the timeline, so subtitles after them will be shifted "
+            f"(see {path.name})")
+        for c in bad:
+            log(f"transcribe:   chunk {c['chunk']:03d} [{c['start']:.1f}s "
+                f"+{c['duration']:.1f}s]: {c['spurious']:.0f}s of cue on silence "
+                f"({c['spurious_fraction'] * 100:.1f}% of cue time), "
+                f"{c['segments']} segment(s) for {c['speech']:.0f}s of speech")
+
+
 def step_transcribe(workdir: Path, model: str, language: str | None,
                     chunk_minutes: int, mock_transcript: Path | None,
                     max_retries: int = 5, retry_base: float = 2.0,
                     retry_max: float = 120.0,
                     acct: Accounting | None = None, *,
-                    provider: str = "mistral") -> list[dict]:
+                    provider: str = "mistral",
+                    silence_dbfs: float = DEFAULT_SILENCE_DBFS,
+                    silence_min_seconds: float = DEFAULT_SILENCE_MIN_SECONDS,
+                    chunk_silence_min_seconds: float = DEFAULT_CHUNK_SILENCE_MIN_SECONDS,
+                    chunk_overlap_seconds: float = DEFAULT_CHUNK_OVERLAP_SECONDS,
+                    coverage_check: bool = True) -> list[dict]:
     transcript_json = workdir / "transcript.json"
     raw_mp4 = workdir / "raw.mp4"
     source = mock_transcript if mock_transcript else raw_mp4
+    chunking = {"max_seconds": chunk_minutes * 60,
+                "long_silence_seconds": float(chunk_silence_min_seconds),
+                "overlap_seconds": float(chunk_overlap_seconds),
+                "silence_dbfs": float(silence_dbfs),
+                "silence_min_seconds": float(silence_min_seconds)}
     provenance = {"provider": provider, "model": model, "language": language,
-                  "chunk_minutes": chunk_minutes, "mock": bool(mock_transcript),
+                  "mock": bool(mock_transcript), "chunking": chunking,
                   "source": file_fingerprint(source) if source.exists() else None}
-    legacy_mistral = provider == "mistral" and not mock_transcript
     if transcript_json.exists():
         cached = json.loads(transcript_json.read_text())
-        if cached.get("_cache") == provenance or (
-                "_cache" not in cached and legacy_mistral and cached.get("model") == model):
+        # No legacy fallback: a transcript cached before silence-aware chunking was
+        # cut differently and its timestamps may be minutes out, so it must be redone.
+        if cached.get("_cache") == provenance:
             log("transcribe: transcript.json matches, skipping")
             return cached["segments"]
-        log("transcribe: transcript.json was produced with different settings")
+        log("transcribe: transcript.json was produced with different settings "
+            "(or predates silence-aware chunking)")
     total_usage: dict = {}
     if mock_transcript:
         log(f"transcribe: using mock transcript {mock_transcript}")
@@ -931,24 +1155,25 @@ def step_transcribe(workdir: Path, model: str, language: str | None,
         if not api_key:
             sys.exit(f"ERROR: {api_key_env} is not set (needed for /v1/audio/transcriptions)")
         duration = probe_duration(raw_mp4)
-        chunk_seconds = chunk_minutes * 60
-        overlap = 15.0  # seconds of overlap between chunks to avoid cutting mid-segment
+        silences = ensure_silence_cache(workdir, silence_dbfs, silence_min_seconds)
+        chunks = build_audio_chunks(duration, silences, chunking["max_seconds"],
+                                    chunking["long_silence_seconds"],
+                                    chunking["overlap_seconds"])
+        silent_total = sum(e - s for s, e in silences
+                           if e - s >= chunking["long_silence_seconds"])
+        log(f"transcribe: {len(chunks)} silence-aware chunk(s), "
+            f"{duration - silent_total:.0f}s of {duration:.0f}s audio, "
+            f"{silent_total:.0f}s of long silence skipped")
         cache_dir = workdir / "chunks"   # per-chunk API results -> resumable
         cache_dir.mkdir(exist_ok=True)
-        # chunk boundaries (deterministic, so cache indexes are stable across runs)
-        boundaries = []
-        start = 0.0
-        while start < duration - 1:
-            boundaries.append((start, min(chunk_seconds, duration - start)))
-            start += chunk_seconds - overlap
         all_segments: list[dict] = []
-        for idx, (start, dur) in enumerate(boundaries):
+        coverage: list[dict] = []
+        for idx, part in enumerate(chunks):
+            start, dur = part.start, part.duration
             cache_file = cache_dir / f"chunk-{idx:03d}.json"
             cache_key = {**provenance, "start": start, "duration": dur}
             payload = json.loads(cache_file.read_text()) if cache_file.exists() else {}
-            if payload.get("_cache") == cache_key or (
-                    "_cache" not in payload and legacy_mistral
-                    and chunk_minutes == API_MAX_CHUNK_MINUTES and payload.get("model") == model):
+            if payload.get("_cache") == cache_key:
                 log(f"transcribe: chunk {idx} [{start:.0f}s +{dur:.0f}s] cached -> {cache_file.name}")
                 raw_segs = payload["segments"]
                 # usage of a cached chunk was already recorded in the ledger when the
@@ -974,14 +1199,18 @@ def step_transcribe(workdir: Path, model: str, language: str | None,
                 accumulate_usage(total_usage, usage)
                 write_stage_json(cache_file, {"_cache": cache_key, "model": model,
                                               "usage": usage, "segments": raw_segs})
+            if coverage_check:
+                coverage.append(chunk_coverage_report(idx, part, raw_segs, silences))
             for s in raw_segs:
                 s = dict(s)
                 s["start"] += start
                 s["end"] += start
-                # drop segments that lie fully inside the overlap tail of this chunk
-                if idx > 0 and s["end"] <= start + overlap:
+                # drop segments that lie fully inside this chunk's overlap tail
+                if s["end"] <= part.drop_before:
                     continue
                 all_segments.append(s)
+        if coverage:
+            report_chunk_coverage(workdir, coverage)
         all_segments.sort(key=lambda s: s["start"])
         segments = all_segments
     # Drop degenerate segments (end <= start): the transcription API occasionally
@@ -1755,6 +1984,15 @@ BUILTIN_DEFAULTS = {
     "max_retries": 5,
     "retry_base_seconds": 2.0,
     "retry_max_seconds": 120.0,
+    "silence_dbfs": DEFAULT_SILENCE_DBFS,
+    "silence_min_seconds": DEFAULT_SILENCE_MIN_SECONDS,
+    "chunk_silence_min_seconds": DEFAULT_CHUNK_SILENCE_MIN_SECONDS,
+    "chunk_overlap_seconds": DEFAULT_CHUNK_OVERLAP_SECONDS,
+    "transcript_coverage_check": True,
+    "align_check": True,
+    "align_samples": 8,
+    "align_search_seconds": 3.0,
+    "align_repair": True,
     "mock_transcript": None,
     "mock_segments": None,
 }
@@ -1789,7 +2027,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--effort", default=None,
                     help="pi thinking/effort level for segmentation")
     ap.add_argument("--chunk-minutes", type=int, default=None,
-                    help="audio chunk size in minutes (default: 55, OpenAI uploads must be under 25 MB)")
+                    help="maximum audio seconds per transcription request, in minutes "
+                         "(default: 55, OpenAI uploads must be under 25 MB); longer "
+                         "speech regions are split into even overlapping pieces")
+    ap.add_argument("--silence-dbfs", type=float, default=None,
+                    help=f"level below which audio counts as silence (default: "
+                         f"{DEFAULT_SILENCE_DBFS} dBFS)")
+    ap.add_argument("--silence-min-seconds", type=float, default=None,
+                    help=f"shortest silence the analysis reports (default: "
+                         f"{DEFAULT_SILENCE_MIN_SECONDS}s)")
+    ap.add_argument("--chunk-silence-min-seconds", type=float, default=None,
+                    help=f"transcription chunks are split at silences at least this long, "
+                         f"and the silence is never uploaded (default: "
+                         f"{DEFAULT_CHUNK_SILENCE_MIN_SECONDS}s)")
+    ap.add_argument("--chunk-overlap-seconds", type=float, default=None,
+                    help=f"overlap between the even pieces of an over-long speech region "
+                         f"(default: {DEFAULT_CHUNK_OVERLAP_SECONDS}s)")
+    ap.add_argument("--no-transcript-coverage-check", dest="transcript_coverage_check",
+                    action="store_false", default=None,
+                    help="do not compare each chunk's transcript against its own audio "
+                         "(the check that warns when a provider's timestamps drift)")
+    ap.add_argument("--no-align-check", dest="align_check", action="store_false",
+                    default=None,
+                    help="skip the post-edit alignment pass (measured audio/video drift "
+                         "per output and .srt repair)")
+    ap.add_argument("--align-samples", type=int, default=None,
+                    help="sample points per output for the alignment pass (default: 8)")
+    ap.add_argument("--align-search-seconds", type=float, default=None,
+                    help="how far either side the alignment pass searches for a match "
+                         "(default: 3s)")
+    ap.add_argument("--no-align-repair", dest="align_repair", action="store_false",
+                    default=None,
+                    help="measure alignment but leave the .srt untouched")
     ap.add_argument("--subs", choices=["embed", "burn", "sidecar"], default=None,
                     help="how to apply subtitles to outputs (default: embed as mov_text)")
     ap.add_argument("--reencode", action="store_true", default=None,
@@ -1919,6 +2188,26 @@ def resolve_options(cli: argparse.Namespace, toml_globals: dict,
     chunk_minutes = opt["chunk_minutes"]
     if type(chunk_minutes) is not int or chunk_minutes <= 0:
         sys.exit("ERROR: chunk_minutes must be a positive integer")
+    max_chunk_seconds = chunk_minutes * 60
+    for key in ("silence_dbfs", "silence_min_seconds", "chunk_silence_min_seconds",
+                "chunk_overlap_seconds", "align_search_seconds"):
+        v = opt[key]
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            sys.exit(f"ERROR: {key} must be a number")
+        opt[key] = float(v)
+    if opt["silence_min_seconds"] <= 0:
+        sys.exit("ERROR: silence_min_seconds must be positive")
+    if opt["silence_dbfs"] >= 0:
+        sys.exit("ERROR: silence_dbfs must be negative (it is a level below full scale)")
+    if opt["chunk_silence_min_seconds"] <= 0:
+        sys.exit("ERROR: chunk_silence_min_seconds must be positive")
+    if not 0 < opt["chunk_overlap_seconds"] < max_chunk_seconds:
+        sys.exit(f"ERROR: chunk_overlap_seconds must be between 0 and the "
+                 f"chunk-minutes limit ({max_chunk_seconds:.0f}s) exclusive")
+    if type(opt["align_samples"]) is not int or opt["align_samples"] < 1:
+        sys.exit("ERROR: align_samples must be a positive integer")
+    if opt["align_search_seconds"] <= 0:
+        sys.exit("ERROR: align_search_seconds must be positive")
     providers = toml_globals.get("providers", {})
     day_options = overrides or {}
     for stage in ("transcribe", "segment"):
@@ -2009,7 +2298,12 @@ def run_pipeline(opt: dict, source: dict, day_title: str | None,
                         opt["chunk_minutes"], opt["mock_transcript"],
                         max_retries=opt["max_retries"], retry_base=opt["retry_base_seconds"],
                         retry_max=opt["retry_max_seconds"], acct=acct,
-                        provider=opt["transcribe_provider"])
+                        provider=opt["transcribe_provider"],
+                        silence_dbfs=opt["silence_dbfs"],
+                        silence_min_seconds=opt["silence_min_seconds"],
+                        chunk_silence_min_seconds=opt["chunk_silence_min_seconds"],
+                        chunk_overlap_seconds=opt["chunk_overlap_seconds"],
+                        coverage_check=opt["transcript_coverage_check"])
     else:
         log("transcribe: skipped")
 

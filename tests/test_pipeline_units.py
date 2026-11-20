@@ -174,6 +174,116 @@ class SilenceCacheTests(unittest.TestCase):
         self.assertTrue(self.cache.exists())
 
 
+class BuildAudioChunksTests(unittest.TestCase):
+    MAX = 3300.0
+
+    def chunks(self, duration, silences, **kw):
+        kw.setdefault("long_silence_seconds", 30.0)
+        kw.setdefault("overlap_seconds", 60.0)
+        return pipeline.build_audio_chunks(duration, silences, self.MAX, **kw)
+
+    def test_long_silence_splits_and_is_never_uploaded(self):
+        chunks = self.chunks(1000.0, [[400.0, 500.0]])
+        self.assertEqual([(c.start, c.end) for c in chunks], [(0.0, 400.0), (500.0, 1000.0)])
+        # no chunk straddles the silence, and none of it is inside a chunk
+        for c in chunks:
+            self.assertFalse(c.start < 450.0 < c.end)
+
+    def test_short_pause_stays_inside_its_chunk(self):
+        chunks = self.chunks(1000.0, [[400.0, 420.0]])   # 20s < 30s
+        self.assertEqual([(c.start, c.end) for c in chunks], [(0.0, 1000.0)])
+
+    def test_leading_and_trailing_silence_are_trimmed(self):
+        chunks = self.chunks(1000.0, [[0.0, 100.0], [900.0, 1000.0]])
+        self.assertEqual([(c.start, c.end) for c in chunks], [(100.0, 900.0)])
+
+    def test_oversize_region_splits_into_even_pieces_under_the_limit(self):
+        chunks = self.chunks(7000.0, [])
+        self.assertEqual(len(chunks), 3)                  # ceil((7000-60)/(3300-60))
+        for c in chunks:
+            self.assertLessEqual(c.duration, self.MAX + 1e-9)
+            self.assertAlmostEqual(c.duration, chunks[0].duration, places=6)
+        self.assertAlmostEqual(chunks[0].start, 0.0, places=6)
+        self.assertAlmostEqual(chunks[-1].end, 7000.0, places=6)
+        # neighbouring pieces overlap by exactly 60s and cover the region without gaps
+        for prev, nxt in zip(chunks, chunks[1:]):
+            self.assertAlmostEqual(nxt.start, prev.end - 60.0, places=6)
+
+    def test_region_just_over_the_limit_still_fits(self):
+        chunks = self.chunks(self.MAX + 1.0, [])
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(c.duration, self.MAX + 1e-9)
+        self.assertAlmostEqual(chunks[-1].end, self.MAX + 1.0, places=6)
+
+    def test_overlap_tail_is_recorded_only_between_split_pieces(self):
+        chunks = self.chunks(7000.0, [])
+        self.assertEqual(chunks[0].drop_before, chunks[0].start)
+        for c in chunks[1:]:
+            self.assertAlmostEqual(c.drop_before, c.start + 60.0, places=6)
+        # a chunk that follows a silence has no overlap to drop
+        after_silence = self.chunks(1000.0, [[400.0, 500.0]])[1]
+        self.assertEqual(after_silence.drop_before, after_silence.start)
+
+    def test_all_silence_still_yields_one_chunk(self):
+        chunks = self.chunks(500.0, [[0.0, 500.0]])
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].duration, 500.0)
+
+
+class ChunkCoverageTests(unittest.TestCase):
+    def report(self, segs, silences, duration=600.0):
+        part = pipeline.AudioChunk(0.0, duration, 0.0)
+        return pipeline.chunk_coverage_report(0, part, segs, silences)
+
+    def test_well_aligned_chunk_passes(self):
+        # cue from 0-100, silence 100-300, cue 300-400
+        segs = [{"start": 0.0, "end": 100.0}, {"start": 300.0, "end": 400.0}]
+        r = self.report(segs, [[100.0, 300.0]])
+        self.assertEqual(r["spurious"], 0.0)
+        self.assertTrue(r["ok"])
+
+    def test_cues_sitting_on_silence_are_flagged(self):
+        # the day-2 failure mode: text over audio that is measurably empty
+        segs = [{"start": 0.0, "end": 100.0}, {"start": 100.0, "end": 300.0}]
+        r = self.report(segs, [[100.0, 300.0]])
+        self.assertAlmostEqual(r["spurious"], 200.0, places=6)
+        self.assertFalse(r["ok"])
+
+    def test_short_silences_are_ignored(self):
+        # a cue running over a 1s inter-word pause is normal, not an error
+        segs = [{"start": 0.0, "end": 100.0}]
+        r = self.report(segs, [[40.0, 41.0]], duration=100.0)
+        self.assertEqual(r["spurious"], 0.0)
+        self.assertTrue(r["ok"])
+
+    def test_empty_transcript_is_flagged(self):
+        r = self.report([], [])
+        self.assertAlmostEqual(r["missed_fraction"], 1.0, places=6)
+        self.assertFalse(r["ok"])
+
+    def test_short_chunk_with_little_speech_is_not_flagged(self):
+        # a brief interjection in a short chunk: low cue time must not look like drift
+        segs = [{"start": 0.0, "end": 5.0}]
+        r = self.report(segs, [[30.0, 32.0]], duration=70.0)
+        self.assertTrue(r["ok"])
+        self.assertGreater(r["missed_fraction"], 0.5)  # informational, not gated
+
+
+class IntervalMathTests(unittest.TestCase):
+    def test_union_merges_touching_intervals(self):
+        self.assertEqual(pipeline._intervals_union([[0, 5], [5, 9], [20, 21]]),
+                         [[0, 9], [20, 21]])
+
+    def test_minus_and_intersect(self):
+        self.assertEqual(pipeline._intervals_minus([[0, 100]], [[10, 20], [50, 60]]),
+                         [[0, 10], [20, 50], [60, 100]])
+        self.assertEqual(pipeline._intervals_intersect([[0, 50]], [[25, 100]]), [[25, 50]])
+
+    def test_empty_intervals_are_dropped(self):
+        self.assertEqual(pipeline._intervals_union([[5, 5], [7, 3]]), [])
+
+
 def make_session_jsonl() -> str:
     """A small synthetic pi session (JSONL) with a tool call and two assistant
     messages carrying usage+cost."""
