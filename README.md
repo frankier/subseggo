@@ -1,4 +1,8 @@
-# YouTube → subtitles → hierarchical segmentation → cut videos with aligned subtitles
+# subseggo
+
+![logo](https://raw.githubusercontent.com/frankier/subseggo/main/logo.png)
+
+YouTube → subtitles → hierarchical segmentation → cut videos with aligned subtitles
 
 `pipeline.py` is a PEP 723 script (`uv run --script`) that:
 
