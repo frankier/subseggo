@@ -19,7 +19,7 @@ edit stages are all cached/skipped automatically):
     process output + its session transcript: fatal causes (out of API money/402,
     auth errors, prompt too large, unknown model, bad request) exit immediately with
     an informative message, anything else (API 5xx, 429, network errors, the run
-    being terminated/killed, unknown random failures) is retried up to 3 total
+    being terminated/killed, unknown random failures) is retried up to 10 total
     attempts (PI_MAX_ATTEMPTS) before dying with the diagnostics.
   1. download    : yt-dlp grabs the YouTube video as raw.mp4 (+ raw.info.json)
   2. transcribe  : silence-aware audio chunks -> Mistral Voxtral by default or
@@ -42,7 +42,7 @@ edit stages are all cached/skipped automatically):
                    so the user's ~/.pi/agent (settings, extensions, custom models,
                    auth) is never read -- same as inside the Docker image; the API
                    key comes from MISTRAL_API_KEY or OPENAI_API_KEY
-                   (transient failures are retried up to 3 attempts; fatal ones like
+                   (transient failures are retried up to 10 attempts; fatal ones like
                    an out-of-balance API exit immediately with an informative error)
                    -> segments.json (intermediate format: segments > sections; days are
                    never guessed -- with --config each video is one day given by the
@@ -168,7 +168,7 @@ DEFAULT_CHAT_USD_PER_1M = {"input": 2.0, "output": 6.0, "cache_read": 0.2, "cach
 PI_SESSION_NAME = "pi-session.jsonl"      # pi's native session transcript (JSONL) in the workdir
 PI_TRANSCRIPT_NAME = "pi-transcript.json"  # plain-JSON extraction of it (messages + usage totals)
 PI_AGENT_DIR_NAME = "pi-agent"             # bare pi config dir inside agent-scratch (PI_CODING_AGENT_DIR)
-PI_MAX_ATTEMPTS = 3                        # total attempts of the segment pi oneshot before dying
+PI_MAX_ATTEMPTS = 10                       # total attempts of the segment pi oneshot before dying
 USAGE_CSV_NAME = "api-usage.csv"
 USAGE_CSV_COLUMNS = ["timestamp", "day", "step", "detail", "model", "requests",
                      "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
