@@ -2,6 +2,8 @@
 
 ![logo](https://raw.githubusercontent.com/frankier/subseggo/main/logo.png)
 
+🤖 This repo is 100% vibe coded and the README is all LLM text 🤖 
+
 YouTube → subtitles → hierarchical segmentation → cut videos with aligned subtitles
 
 `pipeline.py` is a PEP 723 script (`uv run --script`) that:
