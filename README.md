@@ -272,13 +272,20 @@ Set a smaller `chunk_minutes` if needed.
 ## Sandboxing the segment agent
 
 The `pi` oneshot that segments the video is run inside a bubblewrap sandbox
-(`--sandbox auto`, the default; `bwrap` must be on PATH, `none` disables): the
-whole filesystem is mounted read-only except `workdir/agent-scratch/` and an
-ephemeral `/tmp`, so the agent cannot modify pipeline files (`raw.mp4`,
-`keyframes.json`, `segments.json`, ...) even via shell redirects. It also gets
-only the `read` and `bash` tools (`--tools read,bash`). Network stays up for the
-model API call. With `--sandbox auto` and no `bwrap`, the pipeline warns and runs
-unsandboxed.
+(`--sandbox auto`, the default; `bwrap` must be on PATH, `none` disables): a
+whitelist, not a read-only whole filesystem. Mounted are only the system trees
+needed to run the tools and reach the model API (`/usr`, `/etc`, `/run`, `/opt`,
+`/sys`, `/bin`, `/sbin`, `/lib`, `/lib64`, plus the `pi` binary itself when it is
+installed outside those, e.g. under `~/bin`), and of the workdir just its input
+files (`segment-prompt.md`, `raw.mp4`, `raw.info.json`, `keyframes.json`,
+`transcript.*`) read-only at their original paths, plus a writable
+`workdir/agent-scratch/` and an ephemeral `/tmp`. A previous run's outputs
+(`segments.json`, `pi-session.jsonl`, `pi-transcript.json`, ...), the other
+days' workdirs of a `--config` event, the usage ledger and the rest of the
+filesystem are not mounted at all, so the agent can neither read nor modify
+them. It also gets only the `read` and `bash` tools (`--tools read,bash`).
+Network stays up for the model API call. With `--sandbox auto` and no `bwrap`,
+the pipeline warns and runs unsandboxed.
 
 Independently of the sandbox, pi never uses the user's `~/.pi/agent`: every pi
 invocation (including the `--help` capability probes) gets `PI_CODING_AGENT_DIR`

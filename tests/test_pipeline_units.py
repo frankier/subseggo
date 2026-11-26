@@ -817,7 +817,8 @@ class PiBareEnvTests(unittest.TestCase):
     def test_bare_env_dir_is_inside_the_bwrap_writable_bind(self):
         # bwrap_command makes only agent-scratch writable; the bare pi dir must
         # live there so pi can write its cache/auth inside the sandbox too
-        with mock.patch.object(pipeline.shutil, "which", return_value="/usr/bin/bwrap"):
+        which = lambda name: {"bwrap": "/usr/bin/bwrap", "pi": "/x/bin/pi"}.get(name)
+        with mock.patch.object(pipeline.shutil, "which", side_effect=which):
             cmd = pipeline.bwrap_command(["pi", "-p", "hi"], self.dir)
         i = cmd.index("--bind")
         writable = Path(cmd[i + 1])
@@ -1090,19 +1091,111 @@ class SandboxTests(unittest.TestCase):
         with mock.patch.object(pipeline.shutil, "which", return_value=None):
             self.assertFalse(pipeline.resolve_sandbox("auto"))
 
-    def test_bwrap_command_makes_only_scratch_writable(self):
-        with mock.patch.object(pipeline.shutil, "which", return_value="/usr/bin/bwrap"):
-            cmd = pipeline.bwrap_command(["pi", "-p", "hi"], self.dir)
+    def _which(self, name):
+        return {"bwrap": "/usr/bin/bwrap", "pi": str(self.dir / "bin" / "pi")}.get(name)
+
+    def test_bwrap_command_mounts_only_system_dirs_pi_and_workdir_inputs(self):
+        # realistic workdir: the input files + a previous run's outputs; plus a
+        # sibling day workdir and the workdir-root ledger of a --config event
+        work = self.dir / "event" / "day1"
+        work.mkdir(parents=True)
+        for name in pipeline.SEGMENT_SANDBOX_INPUTS:
+            (work / name).write_text("input")
+        for name in ("segments.json", "pi-session.jsonl", "pi-transcript.json",
+                     "segment-raw-output.txt", "api-usage.csv", "silences.json"):
+            (work / name).write_text("SECRET")
+        (self.dir / "event" / "day2").mkdir()
+        (self.dir / "event" / "day2" / "transcript.json").write_text("DAY2")
+        (self.dir / "event" / "api-usage.csv").write_text("LEDGER")
+        (self.dir / "bin").mkdir()
+        (self.dir / "bin" / "pi").write_text("#!/bin/sh\n")
+        with mock.patch.object(pipeline.shutil, "which", side_effect=self._which):
+            cmd = pipeline.bwrap_command(["pi", "-p", "hi"], work)
         self.assertEqual(cmd[0], "/usr/bin/bwrap")
-        self.assertEqual(cmd[cmd.index("--ro-bind") + 1:cmd.index("--ro-bind") + 3],
-                         ["/", "/"])
-        i = cmd.index("--bind")
-        scratch = str((self.dir / "agent-scratch").resolve())
-        self.assertEqual(cmd[i + 1:i + 3], [scratch, scratch])
+        ro = [(cmd[i + 1], cmd[i + 2]) for i, a in enumerate(cmd) if a == "--ro-bind"]
+        ro_srcs = [s for s, _ in ro]
+        # whitelist, not a whole-filesystem bind
+        self.assertNotIn("/", ro_srcs)
+        for d in ("/usr", "/etc", "/run"):
+            self.assertIn(d, ro_srcs)
+        # pi itself is bound (installed outside the system dirs here)
+        self.assertIn(str(self.dir / "bin" / "pi"), ro_srcs)
+        # every existing input file is bound read-only at its ORIGINAL path
+        for name in pipeline.SEGMENT_SANDBOX_INPUTS:
+            self.assertIn((str(work / name), str(work / name)), ro)
+        # previous-run outputs, the sibling day and the root ledger are NOT mounted
+        for secret in ("segments.json", "pi-session.jsonl", "pi-transcript.json",
+                       "segment-raw-output.txt", "api-usage.csv", "silences.json"):
+            self.assertNotIn(str(work / secret), ro_srcs)
+        self.assertNotIn(str(self.dir / "event" / "day2"), ro_srcs)
+        self.assertNotIn(str(self.dir / "event" / "api-usage.csv"), ro_srcs)
+        self.assertNotIn(str(self.dir / "event"), ro_srcs)
+        # the workdir itself is only an empty --dir chain; the payload's cwd is it
+        dirs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--dir"]
+        self.assertIn(str(work.resolve()), dirs)
+        self.assertEqual(cmd[cmd.index("--chdir") + 1], str(work.resolve()))
+        # agent-scratch is the only writable bind
+        binds = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--bind"]
+        self.assertEqual(binds, [str((work / "agent-scratch").resolve())])
+        self.assertTrue((work / "agent-scratch").is_dir())
+        # ephemeral /tmp + HOME redirect; the payload command is intact
         self.assertIn("--tmpfs", cmd)
-        self.assertIn("/tmp/pi-home", cmd)  # HOME redirected into the tmpfs
-        self.assertEqual(cmd[cmd.index("--") + 1:], ["pi", "-p", "hi"])  # cmd intact
-        self.assertTrue((self.dir / "agent-scratch").is_dir())
+        self.assertIn("/tmp/pi-home", cmd)
+        self.assertEqual(cmd[cmd.index("--") + 1:], ["pi", "-p", "hi"])
+
+    def test_bwrap_command_skips_input_files_that_do_not_exist(self):
+        work = self.dir / "w"
+        work.mkdir()
+        (work / "raw.mp4").write_text("x")
+        with mock.patch.object(pipeline.shutil, "which", side_effect=self._which):
+            cmd = pipeline.bwrap_command(["pi"], work)
+        ro_srcs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--ro-bind"]
+        self.assertIn(str(work / "raw.mp4"), ro_srcs)
+        self.assertNotIn(str(work / "keyframes.json"), ro_srcs)
+        self.assertNotIn(str(work / "transcript.json"), ro_srcs)
+        self.assertNotIn(str(work / "segment-prompt.md"), ro_srcs)
+
+    def test_sandbox_pi_binds_cover_npm_global_install(self):
+        # ~/bin/pi -> ~/lib/node_modules/@scope/pi-pkg/bin/cli.js: the entry must be
+        # recreated as the SAME symlink (wrappers locate their install via
+        # `readlink -f $0`), the real script and the node_modules tree bound ro
+        home = self.dir / "home" / "u"
+        cli = home / "lib" / "node_modules" / "@scope" / "pi-pkg" / "bin" / "cli.js"
+        cli.parent.mkdir(parents=True)
+        cli.write_text("// pi")
+        (home / "bin").mkdir()
+        (home / "bin" / "pi").symlink_to(cli)
+        with mock.patch.object(pipeline.shutil, "which",
+                               return_value=str(home / "bin" / "pi")):
+            binds = {(op, s): d for op, s, d in pipeline._sandbox_pi_binds("pi")}
+        entry = str(home / "bin" / "pi")
+        self.assertEqual(binds[("symlink", str(cli))], entry)
+        self.assertEqual(binds[("ro-bind", str(cli))], str(cli))
+        self.assertEqual(binds[("ro-bind", str(home / "lib" / "node_modules"))],
+                         str(home / "lib" / "node_modules"))
+
+    def test_sandbox_pi_binds_managed_install_tree(self):
+        # ~/.pi/agent/bin/pi with the versioned install at ~/.pi/agent/install/...:
+        # the install marker dir must be bound, but NOT the whole ~/.pi
+        home = self.dir / "home" / "u"
+        wrapper = home / ".pi" / "agent" / "bin" / "pi"
+        (home / ".pi" / "agent" / "install" / "releases" / "1.0.0").mkdir(parents=True)
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        wrapper.write_text("#!/bin/sh\n")
+        with mock.patch.object(pipeline.shutil, "which", return_value=str(wrapper)):
+            binds = {(op, s): d for op, s, d in pipeline._sandbox_pi_binds("pi")}
+        self.assertEqual(binds[("ro-bind", str(wrapper))], str(wrapper))
+        self.assertEqual(binds[("ro-bind", str(home / ".pi" / "agent" / "bin"))],
+                         str(home / ".pi" / "agent" / "bin"))
+        self.assertEqual(binds[("ro-bind", str(home / ".pi" / "agent" / "install"))],
+                         str(home / ".pi" / "agent" / "install"))
+        self.assertNotIn(("ro-bind", str(home / ".pi")), binds)
+
+    def test_sandbox_pi_binds_under_system_dirs_are_dropped(self):
+        # a pi installed in /usr needs no extra mounts (and bwrap cannot mount over
+        # the /usr/bin/sh-style symlinks there anyway)
+        with mock.patch.object(pipeline.shutil, "which", return_value="/usr/bin/pi"):
+            self.assertEqual(pipeline._sandbox_pi_binds("pi"), [])
 
 class SkipStageTests(unittest.TestCase):
     """--skip-* must not demand the artefacts of the stages they skip."""

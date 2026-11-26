@@ -35,9 +35,13 @@ edit stages are all cached/skipped automatically):
                    --no-transcript-coverage-check) so a drifting provider is reported.
   3. segment     : `pi` oneshot (Mistral Large by default or OpenAI GPT-6.1 Terra,
                    medium effort) over the transcript,
-                   run in a bubblewrap read-only sandbox when available (--sandbox;
-                   the workdir is read-only except agent-scratch/, so the agent cannot
-                   clobber pipeline files). pi always runs with a BARE config:
+                   run in a bubblewrap whitelist sandbox when available (--sandbox):
+                   only the workdir's input files (segment-prompt.md, raw.mp4,
+                   raw.info.json, keyframes.json, transcript.*) are mounted read-only,
+                   plus a writable agent-scratch/ and the system trees needed to run
+                   pi/ffmpeg -- so the agent can neither read nor clobber a previous
+                   run's outputs, the other days' workdirs, or anything else on the
+                   filesystem). pi always runs with a BARE config:
                    PI_CODING_AGENT_DIR points at a fresh empty dir in agent-scratch,
                    so the user's ~/.pi/agent (settings, extensions, custom models,
                    auth) is never read -- same as inside the Docker image; the API
@@ -107,6 +111,9 @@ See config.example.toml.
 
 Requires on PATH: ffmpeg, ffprobe, pi, imagemagick (compare; lets the segment model
 fine-tune cut points visually) (and node as yt-dlp JS runtime, optional).
+bubblewrap (bwrap) is optional: with it on PATH the segment pi oneshot runs in the
+whitelist sandbox (--sandbox auto, the default); without it the pipeline warns and
+runs unsandboxed (--sandbox none forces that).
 Requires env: MISTRAL_API_KEY and/or OPENAI_API_KEY for the providers in use.
 """
 
@@ -169,6 +176,21 @@ PI_SESSION_NAME = "pi-session.jsonl"      # pi's native session transcript (JSON
 PI_TRANSCRIPT_NAME = "pi-transcript.json"  # plain-JSON extraction of it (messages + usage totals)
 PI_AGENT_DIR_NAME = "pi-agent"             # bare pi config dir inside agent-scratch (PI_CODING_AGENT_DIR)
 PI_MAX_ATTEMPTS = 10                       # total attempts of the segment pi oneshot before dying
+# The only workdir files the sandboxed segment agent may READ: the stage's input
+# files. A previous run's outputs (segments.json, pi-session.jsonl,
+# pi-transcript.json, segment-raw-output.txt), the usage ledger, chunk caches and
+# edit outputs are deliberately NOT mounted into the sandbox, nor is anything
+# outside the workdir (the sibling workdirs of a --config event's other days, the
+# rest of the filesystem).
+SEGMENT_SANDBOX_INPUTS = ["segment-prompt.md", "raw.info.json", "raw.mp4", "keyframes.json",
+                          "transcript.json", "transcript.txt", "raw.srt"]
+# System trees mounted read-only into the sandbox so the agent can run its tools
+# (pi/node/ffmpeg/ImageMagick/python under /usr; /bin,/sbin,/lib,/lib64 are bound
+# as well for non-merged-usr systems -- on merged-usr ones they are symlinks into
+# /usr, which resolves inside the sandbox) and reach the model API (DNS via
+# /etc/resolv.conf -> /run, CA certs and host config via /etc).
+SANDBOX_SYSTEM_DIRS = ["/usr", "/etc", "/run", "/opt", "/sys",
+                       "/bin", "/sbin", "/lib", "/lib64"]
 USAGE_CSV_NAME = "api-usage.csv"
 USAGE_CSV_COLUMNS = ["timestamp", "day", "step", "detail", "model", "requests",
                      "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
@@ -1386,12 +1408,14 @@ def build_segment_prompt(workdir: Path, segments: list[dict],
         )
     if sandboxed:
         sandbox_note = (
-            "FILE ACCESS: this directory is mounted READ-ONLY for you (bubblewrap sandbox).\n"
-            "Write ALL scratch files -- frames, packet CSVs, helper scripts, notes, your\n"
-            "session file -- into the agent-scratch/ subdirectory only; writes anywhere else\n"
-            "will fail. keyframes.json, segments.json, raw.mp4, raw.srt, transcript.*,\n"
-            "segment-prompt.md, pi-session.jsonl and pi-transcript.json are pipeline-owned\n"
-            "and protected."
+            "FILE ACCESS: you run inside a bubblewrap sandbox. Of this directory only your\n"
+            "INPUT files are mounted, read-only: segment-prompt.md, raw.mp4, raw.info.json,\n"
+            "keyframes.json and the transcript files (whichever exist). Everything else is\n"
+            "INVISIBLE to you: previous runs' outputs (segments.json, pi-session.jsonl,\n"
+            "pi-transcript.json, segment-raw-output.txt), the other videos/days of this\n"
+            "event, and the rest of the filesystem. agent-scratch/ is the only writable\n"
+            "place -- write ALL scratch files (frames, packet CSVs, helper scripts, notes,\n"
+            "your session file) there; writes anywhere else will fail."
         )
     else:
         sandbox_note = (
@@ -1476,25 +1500,155 @@ def resolve_sandbox(mode: str) -> bool:
     return False
 
 
+def _home_tree_roots_of(paths: list[Path]) -> list[Path]:
+    """The top-level tree under $HOME (or /root) containing each given path, e.g.
+    /home/u/install/x -> /home/u/install. Used to bind only the part of a home
+    directory a path belongs to, never the whole home."""
+    roots: set[Path] = set()
+    for p in paths:
+        parts = p.parts  # ('/', 'home', '<user>', '<first>', ...)
+        if len(parts) >= 4 and parts[1] == "home":
+            roots.add(Path(*parts[:4]))
+        elif len(parts) >= 3 and parts[1] == "root":
+            roots.add(Path(*parts[:3]))
+    return sorted(roots)
+
+
+def _wrapper_referenced_paths(script: Path) -> list[Path]:
+    """Absolute /home/... or /root/... paths a wrapper script references (e.g.
+    ~/bin/pi reading $HOME/install/current-version to find its versioned
+    install). Only text scripts are scanned (an ELF binary references nothing
+    readable this way); $HOME/~ are expanded from the script's own location.
+    The result feeds _home_tree_roots_of."""
+    try:
+        with script.open("rb") as f:
+            head = f.read(65536)
+    except OSError:
+        return []
+    if head.startswith(b"\x7fELF"):
+        return []
+    text = head.decode("utf-8", errors="ignore")
+    parts = script.parts  # ('/', 'home', '<user>', ...)
+    if len(parts) >= 3 and parts[1] == "home":
+        home = str(Path(*parts[:3]))
+    elif len(parts) >= 2 and parts[1] == "root":
+        home = "/root"
+    else:
+        home = None
+    if home:
+        text = re.sub(r"\$\{HOME\}|\$HOME|~", home.replace("\\", "\\\\"), text)
+    out: list[Path] = []
+    for m in re.finditer(r"(?<![\w.\-~$])(/home/[^\s'\"`]+|/root/[^\s'\"`]+)", text):
+        out.append(Path(m.group(1).rstrip(".,;:")))
+    return out
+
+
+def _sandbox_pi_binds(pi_bin: str) -> list[tuple[str, str, str]]:
+    """(op, src, dst) mount ops that keep the pi binary itself runnable inside the
+    whitelist sandbox when it is installed outside the system dirs:
+      - the entry point as found on PATH. When it is a symlink it is recreated as
+        the SAME symlink (--symlink), not bind-mounted through: wrapper scripts
+        locate their install via `readlink -f $0`, which must resolve exactly as
+        on the host;
+      - the resolved real path, plus its bin/ directory when it lives in one;
+      - the pi install tree around the real script: marker dirs (node_modules,
+        install) in its ancestor directories, up to but not including the home
+        root -- never all of $HOME (npm-global trees, managed installs like
+        ~/.pi/agent/install/releases/<ver>/...);
+      - the $HOME trees referenced by absolute path literals in wrapper scripts
+        (a managed wrapper like ~/bin/pi reading $HOME/install/current-version).
+    Ops whose destination the system-dir mounts already provide are dropped
+    (bwrap cannot mount over e.g. the /usr/bin/sh symlink)."""
+    entry = Path(shutil.which(pi_bin) or pi_bin)
+    real = entry.resolve()
+    binds: list[tuple[str, str, str]] = []
+    if entry.is_symlink():
+        binds.append(("symlink", os.readlink(entry), str(entry)))
+    else:
+        binds.append(("ro-bind", str(entry), str(entry)))
+    if real != entry:
+        binds.append(("ro-bind", str(real), str(real)))
+    if real.parent.name == "bin":
+        binds.append(("ro-bind", str(real.parent), str(real.parent)))
+    parts = real.parts  # ('/', 'home', '<user>', ...)
+    if len(parts) >= 3 and parts[1] == "home":
+        home_root: Path | None = Path(*parts[:3])
+    elif len(parts) >= 2 and parts[1] == "root":
+        home_root = Path("/root")
+    else:
+        home_root = None
+    for anc in real.parents:
+        if anc == Path("/") or anc == home_root:
+            break
+        for marker in ("node_modules", "install"):
+            if (anc / marker).is_dir():
+                binds.append(("ro-bind", str(anc / marker), str(anc / marker)))
+    for root in _home_tree_roots_of(_wrapper_referenced_paths(entry)
+                                    + _wrapper_referenced_paths(real)):
+        binds.append(("ro-bind", str(root), str(root)))
+    sys_dirs = [Path(d) for d in SANDBOX_SYSTEM_DIRS if Path(d).exists()]
+
+    def covered(p: str) -> bool:
+        q = Path(p)
+        return any(q == d or d in q.parents for d in sys_dirs)
+
+    seen: set[tuple[str, str]] = set()
+    out = []
+    for op, s, d in binds:
+        if op == "symlink" or not covered(s):
+            key = (op, s)
+            if key not in seen:
+                seen.add(key)
+                out.append((op, s, d))
+    return out
+
+
 def bwrap_command(cmd: list[str], workdir: Path) -> list[str]:
-    """Wrap `cmd` in a bubblewrap sandbox: the whole filesystem is mounted
-    read-only except workdir/agent-scratch/ (created here) and an ephemeral
-    /tmp, so the agent cannot modify pipeline files (raw.mp4, keyframes.json,
-    segments.json, ...) even via shell redirects. HOME/TMPDIR point into the
-    tmpfs so pi itself writes nothing persistent. Network stays up (the model
-    API call needs it) and the environment (e.g. MISTRAL_API_KEY, and
-    PI_CODING_AGENT_DIR from pi_bare_env, which lands on the writable scratch
-    bind) passes through."""
-    scratch = (workdir / "agent-scratch").resolve()
+    """Wrap `cmd` in a bubblewrap sandbox that mounts ONLY what the segment agent
+    needs (a whitelist, not a read-only whole-filesystem bind):
+
+      - the system trees (SANDBOX_SYSTEM_DIRS) read-only, so pi/node/ffmpeg/
+        ImageMagick/python run and the model API stays reachable (DNS via
+        /etc/resolv.conf -> /run, CA certs and host config via /etc); plus the pi
+        binary itself when it is installed outside those trees (~/bin/pi, an npm
+        prefix, ...) -- see _sandbox_pi_binds;
+      - the workdir as an EMPTY directory chain (--dir) with only its input files
+        (SEGMENT_SANDBOX_INPUTS) bind-mounted read-only at their original paths,
+        and agent-scratch/ (created here) as the single writable bind. A previous
+        run's outputs (segments.json, pi-session.jsonl, pi-transcript.json,
+        segment-raw-output.txt, ...), the sibling workdirs of a --config event's
+        other days, the usage ledger and the rest of the filesystem are simply
+        not mounted, so the agent can neither read nor clobber them;
+      - /dev, /proc, an ephemeral /tmp with HOME/TMPDIR pointing into it, so pi
+        writes nothing persistent. Network stays up (the model API call needs it)
+        and the environment (e.g. MISTRAL_API_KEY, and PI_CODING_AGENT_DIR from
+        pi_bare_env, which lands on the writable scratch bind) passes through.
+
+    The payload runs with cwd = workdir (--chdir), so the relative paths used in
+    the prompt (raw.mp4, keyframes.json, agent-scratch/) work unchanged."""
+    workdir = workdir.resolve()
+    scratch = workdir / "agent-scratch"
     scratch.mkdir(exist_ok=True)
-    return [shutil.which("bwrap"), "--ro-bind", "/", "/",
-            "--bind", str(scratch), str(scratch),
-            "--dev-bind", "/dev", "/dev", "--proc", "/proc",
-            "--tmpfs", "/tmp",
-            "--setenv", "HOME", "/tmp/pi-home",
-            "--setenv", "TMPDIR", "/tmp",
-            "--dir", "/tmp/pi-home",
-            "--"] + cmd
+    args = [shutil.which("bwrap")]
+    for d in SANDBOX_SYSTEM_DIRS:
+        if Path(d).exists():
+            args += ["--ro-bind", d, d]
+    for op, src, dst in _sandbox_pi_binds(cmd[0]):
+        args += ["--symlink", src, dst] if op == "symlink" else ["--ro-bind", src, dst]
+    args += ["--dev-bind", "/dev", "/dev", "--proc", "/proc",
+             "--tmpfs", "/tmp",
+             "--setenv", "HOME", "/tmp/pi-home",
+             "--setenv", "TMPDIR", "/tmp",
+             "--dir", "/tmp/pi-home",
+             "--dir", str(workdir)]
+    for name in SEGMENT_SANDBOX_INPUTS:
+        f = workdir / name
+        if f.is_file():
+            args += ["--ro-bind", str(f), str(f)]
+    args += ["--bind", str(scratch), str(scratch),
+             "--chdir", str(workdir),
+             "--"] + cmd
+    return args
 
 
 def build_pi_oneshot_cmd(pi_bin: str, model: str, effort: str,
