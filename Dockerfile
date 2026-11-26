@@ -12,6 +12,7 @@ ARG PI_VERSION=1.5.2
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        bubblewrap \
         ffmpeg \
         ca-certificates \
         curl \
