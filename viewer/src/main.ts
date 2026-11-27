@@ -160,10 +160,13 @@ async function main(): Promise<void> {
     },
     onStateChange: (state) => updatePlayButton(state),
   });
-  playBtn.addEventListener('click', () => {
+  // shared by the transport button and the click-catcher over the video
+  function togglePlay(): void {
     if (player.getState() === PLAYER_STATE.PLAYING) player.pause();
     else player.play();
-  });
+  }
+  playBtn.addEventListener('click', togglePlay);
+  document.getElementById('click-catcher')!.addEventListener('click', togglePlay);
 
   seekBar = new SeekBar(seek);
   renderDay(dayIdx);

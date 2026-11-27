@@ -81,7 +81,16 @@ export async function createPlayer(
     let handle: PlayerHandle;
     const player = new YT.Player(element, {
       videoId,
-      playerVars: { controls: 0, rel: 0, modestbranding: 1, disablekb: 1 },
+      playerVars: {
+        controls: 0,        // no control bar
+        rel: 0,             // no related-videos endscreen
+        modestbranding: 1,  // minimal YouTube chrome
+        disablekb: 1,       // no keyboard shortcuts
+        fs: 0,              // no fullscreen button
+        playsinline: 1,     // inline playback on iOS
+        iv_load_policy: 3,  // no annotation cards
+        cc_load_policy: 0,  // never show the video's own captions; the viewer renders transcript.json itself
+      },
       events: {
         onReady: () => {
           handlers.onReady?.(handle);

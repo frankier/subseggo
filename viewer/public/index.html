@@ -13,7 +13,12 @@
   <div id="error" hidden></div>
   <main>
     <section class="player-pane">
-      <div id="player"></div>
+      <div id="player-wrap">
+        <div id="player"></div>
+        <!-- transparent click-catcher: the iframe never sees hover (no YouTube
+             hover overlays at all); clicking toggles play/pause -->
+        <div id="click-catcher" role="button" aria-label="play or pause"></div>
+      </div>
       <div class="transport">
         <button id="play-pause" type="button">Play</button>
         <div id="seekbar">

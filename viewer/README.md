@@ -54,9 +54,12 @@ config shape), e.g. `DATA_DIR=../work/my-video npm run bundle`.
 
 ## UI behavior
 
-- The embed has no YouTube controls; transport is the viewer's own play/pause
-  button, a custom seek bar, and a clock showing time relative to the start of
-  the current segment ("episode").
+- The embed has no YouTube controls and no hover overlays: a transparent
+  click-catcher sits over the iframe so it never sees the mouse, and clicking
+  the video toggles play/pause. The video's own captions are disabled
+  (`cc_load_policy=0`) — subtitles come only from `transcript.json`. Transport
+  is the viewer's own play/pause button, a custom seek bar, and a clock showing
+  time relative to the start of the current segment ("episode").
 - Seek bar: one colored block per section, colors shared with the segment
   overview badges, hover tooltip with `kind: title`, click to seek.
 - Transcript: prev/next cue buttons, cue timestamps relative to the episode start

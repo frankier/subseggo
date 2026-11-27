@@ -115,8 +115,12 @@ main {
   padding: 12px;
 }
 
+#player-wrap { position: relative; width: 100%; }
 #player { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 6px; overflow: hidden; }
 #player iframe { width: 100%; height: 100%; border: 0; display: block; }
+/* sits on top of the iframe so it never receives hover/clicks from the user;
+   the viewer handles clicks itself (play/pause toggle) */
+#click-catcher { position: absolute; inset: 0; z-index: 1; cursor: pointer; }
 
 /* transport: play/pause + custom seek bar + episode-relative clock */
 .transport {
