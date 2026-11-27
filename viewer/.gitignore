@@ -1,0 +1,14 @@
+# only the viewer itself is tracked; local data drops (pipeline workdirs) stay out
+/*
+!/.gitignore
+!/README.md
+!/package.json
+!/package-lock.json
+!/tsconfig.json
+!/public/
+!/scripts/
+!/src/
+
+# build output
+node_modules/
+dist/

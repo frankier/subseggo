@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>yt-segment viewer</title>
+  <link rel="stylesheet" href="__MAIN_CSS__">
+</head>
+<body>
+  <header>
+    <button id="theme-toggle" type="button" class="subtle" title="toggle light/dark">Dark</button>
+  </header>
+  <div id="error" hidden></div>
+  <main>
+    <section class="player-pane">
+      <div id="player-wrap">
+        <div id="player"></div>
+        <!-- transparent click-catcher: the iframe never sees hover (no YouTube
+             hover overlays at all); clicking toggles play/pause -->
+        <div id="click-catcher" role="button" aria-label="play or pause"></div>
+      </div>
+      <div class="transport">
+        <button id="play-pause" type="button">Play</button>
+        <div id="seekbar">
+          <div id="seek-tooltip" hidden></div>
+        </div>
+        <span id="clock">0:00</span>
+      </div>
+      <div class="subtitle-controls">
+        <button id="prev-cue" type="button">&lt;&lt; Prev cue</button>
+        <span id="cue-pos"></span>
+        <button id="next-cue" type="button">Next cue &gt;&gt;</button>
+        <button id="follow-toggle" type="button" aria-pressed="true" class="subtle">Follow</button>
+      </div>
+      <div id="current-cue"></div>
+      <ol id="cue-list"></ol>
+    </section>
+    <aside class="segments-pane">
+      <div class="segments-header">
+        <h2>Segments</h2>
+        <button id="prev-segment" type="button">&lt;&lt; Prev</button>
+        <button id="next-segment" type="button">Next &gt;&gt;</button>
+      </div>
+      <div id="segment-tree"></div>
+    </aside>
+  </main>
+  <script type="module" src="__MAIN_JS__"></script>
+</body>
+</html>
