@@ -278,7 +278,7 @@ needed to run the tools and reach the model API (`/usr`, `/etc`, `/run`, `/opt`,
 `/sys`, `/bin`, `/sbin`, `/lib`, `/lib64`, plus the `pi` binary itself when it is
 installed outside those, e.g. under `~/bin`), and of the workdir just its input
 files (`segment-prompt.md`, `raw.mp4`, `raw.info.json`, `keyframes.json`,
-`transcript.*`) read-only at their original paths, plus a writable
+`silences.json`, `transcript.*`) read-only at their original paths, plus a writable
 `workdir/agent-scratch/` and an ephemeral `/tmp`. A previous run's outputs
 (`segments.json`, `pi-session.jsonl`, `pi-transcript.json`, ...), the other
 days' workdirs of a `--config` event, the usage ledger and the rest of the
