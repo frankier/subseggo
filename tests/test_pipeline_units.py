@@ -1102,7 +1102,7 @@ class SandboxTests(unittest.TestCase):
         for name in pipeline.SEGMENT_SANDBOX_INPUTS:
             (work / name).write_text("input")
         for name in ("segments.json", "pi-session.jsonl", "pi-transcript.json",
-                     "segment-raw-output.txt", "api-usage.csv", "silences.json"):
+                     "segment-raw-output.txt", "api-usage.csv"):
             (work / name).write_text("SECRET")
         (self.dir / "event" / "day2").mkdir()
         (self.dir / "event" / "day2" / "transcript.json").write_text("DAY2")
@@ -1124,8 +1124,10 @@ class SandboxTests(unittest.TestCase):
         for name in pipeline.SEGMENT_SANDBOX_INPUTS:
             self.assertIn((str(work / name), str(work / name)), ro)
         # previous-run outputs, the sibling day and the root ledger are NOT mounted
+        # (keyframes.json/silences.json ARE mounted -- they are in
+        # SEGMENT_SANDBOX_INPUTS, asserted by the loop above)
         for secret in ("segments.json", "pi-session.jsonl", "pi-transcript.json",
-                       "segment-raw-output.txt", "api-usage.csv", "silences.json"):
+                       "segment-raw-output.txt", "api-usage.csv"):
             self.assertNotIn(str(work / secret), ro_srcs)
         self.assertNotIn(str(self.dir / "event" / "day2"), ro_srcs)
         self.assertNotIn(str(self.dir / "event" / "api-usage.csv"), ro_srcs)
@@ -1152,6 +1154,7 @@ class SandboxTests(unittest.TestCase):
         ro_srcs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--ro-bind"]
         self.assertIn(str(work / "raw.mp4"), ro_srcs)
         self.assertNotIn(str(work / "keyframes.json"), ro_srcs)
+        self.assertNotIn(str(work / "silences.json"), ro_srcs)
         self.assertNotIn(str(work / "transcript.json"), ro_srcs)
         self.assertNotIn(str(work / "segment-prompt.md"), ro_srcs)
 

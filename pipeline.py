@@ -37,7 +37,8 @@ edit stages are all cached/skipped automatically):
                    medium effort) over the transcript,
                    run in a bubblewrap whitelist sandbox when available (--sandbox):
                    only the workdir's input files (segment-prompt.md, raw.mp4,
-                   raw.info.json, keyframes.json, transcript.*) are mounted read-only,
+                   raw.info.json, keyframes.json, silences.json, transcript.*) are
+                   mounted read-only,
                    plus a writable agent-scratch/ and the system trees needed to run
                    pi/ffmpeg -- so the agent can neither read nor clobber a previous
                    run's outputs, the other days' workdirs, or anything else on the
@@ -177,13 +178,14 @@ PI_TRANSCRIPT_NAME = "pi-transcript.json"  # plain-JSON extraction of it (messag
 PI_AGENT_DIR_NAME = "pi-agent"             # bare pi config dir inside agent-scratch (PI_CODING_AGENT_DIR)
 PI_MAX_ATTEMPTS = 10                       # total attempts of the segment pi oneshot before dying
 # The only workdir files the sandboxed segment agent may READ: the stage's input
-# files. A previous run's outputs (segments.json, pi-session.jsonl,
-# pi-transcript.json, segment-raw-output.txt), the usage ledger, chunk caches and
+# files, including the pre-computed keyframe and silence caches. A previous run's
+# outputs (segments.json, pi-session.jsonl, pi-transcript.json,
+# segment-raw-output.txt), the usage ledger, the transcription chunk caches and
 # edit outputs are deliberately NOT mounted into the sandbox, nor is anything
 # outside the workdir (the sibling workdirs of a --config event's other days, the
 # rest of the filesystem).
 SEGMENT_SANDBOX_INPUTS = ["segment-prompt.md", "raw.info.json", "raw.mp4", "keyframes.json",
-                          "transcript.json", "transcript.txt", "raw.srt"]
+                          "silences.json", "transcript.json", "transcript.txt", "raw.srt"]
 # System trees mounted read-only into the sandbox so the agent can run its tools
 # (pi/node/ffmpeg/ImageMagick/python under /usr; /bin,/sbin,/lib,/lib64 are bound
 # as well for non-merged-usr systems -- on merged-usr ones they are symlinks into
@@ -1349,6 +1351,8 @@ point from the transcript, refine it using the visuals:
   see where the picture actually changes (slide transitions, camera cuts,
   screen-share start/stop, black or break frames).
 {sandbox_note}
+AUDIO SILENCES:
+{silence_note}
 KEYFRAME CUTS:
 The edit stage cuts with stream copy, so every cut point must be a video keyframe
 (use the keyframe list above). When fine-tuning a boundary, snap it to a
@@ -1406,21 +1410,45 @@ def build_segment_prompt(workdir: Path, segments: list[dict],
             "      ffprobe -v error -select_streams v:0 -show_entries packet=pts_time,dts_time,flags -of csv=p=0 raw.mp4 > agent-scratch/packets.csv\n"
             "  (each CSV line is pts,dts,flags; a flags field containing K = keyframe)"
         )
+    if (workdir / "silences.json").is_file():
+        silence_note = (
+            "The audio silences have ALREADY been analysed by the pipeline (ffmpeg\n"
+            "silencedetect) and stored as JSON in silences.json in this directory:\n"
+            "      {\"version\": 1, \"source\": \"raw.mp4\", \"fingerprint\": {...}, \"params\": {...}, \"silences\": [[start, end], ...]}\n"
+            "  (times in seconds; each [start, end] pair is one silent stretch of the\n"
+            "  audio). READ that file, e.g.:\n"
+            "      python3 -c \"import json; print(json.load(open('silences.json'))['silences'])\"\n"
+            "  Use it where it helps: a long silent stretch usually IS a break/lunch, so\n"
+            "  \"break\" sections should cover the detected silences, and a boundary that\n"
+            "  lands inside a long silence is a safe cut point. Do NOT run ffmpeg\n"
+            "  silencedetect again, and NEVER create, overwrite or delete silences.json\n"
+            "  or any other pipeline file."
+        )
+    else:
+        silence_note = (
+            "No pre-computed silence analysis exists for this run (silences.json is\n"
+            "absent -- the transcribe stage was skipped). If you need audio silences,\n"
+            "detect them yourself, writing the raw log into the scratch dir only:\n"
+            "      ffmpeg -hide_banner -vn -i raw.mp4 -af silencedetect=noise=-60dB:d=0.5 -f null - 2> agent-scratch/silences.log\n"
+            "  (parse the silence_start/silence_end pairs from the log; -60dB and 0.5s\n"
+            "  are the pipeline's defaults)"
+        )
     if sandboxed:
         sandbox_note = (
             "FILE ACCESS: you run inside a bubblewrap sandbox. Of this directory only your\n"
             "INPUT files are mounted, read-only: segment-prompt.md, raw.mp4, raw.info.json,\n"
-            "keyframes.json and the transcript files (whichever exist). Everything else is\n"
-            "INVISIBLE to you: previous runs' outputs (segments.json, pi-session.jsonl,\n"
-            "pi-transcript.json, segment-raw-output.txt), the other videos/days of this\n"
-            "event, and the rest of the filesystem. agent-scratch/ is the only writable\n"
-            "place -- write ALL scratch files (frames, packet CSVs, helper scripts, notes,\n"
-            "your session file) there; writes anywhere else will fail."
+            "keyframes.json, silences.json and the transcript files (whichever exist).\n"
+            "Everything else is INVISIBLE to you: previous runs' outputs (segments.json,\n"
+            "pi-session.jsonl, pi-transcript.json, segment-raw-output.txt), the other\n"
+            "videos/days of this event, and the rest of the filesystem. agent-scratch/ is\n"
+            "the only writable place -- write ALL scratch files (frames, packet CSVs,\n"
+            "helper scripts, notes, your session file) there; writes anywhere else will\n"
+            "fail."
         )
     else:
         sandbox_note = (
             "FILE ACCESS: never create, overwrite or delete pipeline files (keyframes.json,\n"
-            "segments.json, raw.mp4, raw.srt, transcript.*, segment-prompt.md,\n"
+            "silences.json, segments.json, raw.mp4, raw.srt, transcript.*, segment-prompt.md,\n"
             "pi-session.jsonl, pi-transcript.json). Write ALL scratch files (frames, packet\n"
             "CSVs, helper scripts, your session file) into agent-scratch/ only."
         )
@@ -1442,7 +1470,7 @@ def build_segment_prompt(workdir: Path, segments: list[dict],
             f'segment only the segments/sections within this video.\n'
         )
     return SEGMENT_PROMPT.format(
-        day_mode=day_mode, kf_note=kf_note, sandbox_note=sandbox_note,
+        day_mode=day_mode, kf_note=kf_note, silence_note=silence_note, sandbox_note=sandbox_note,
         title=info.get("title", ""), uploader=info.get("uploader", ""),
         duration=duration, duration_hms=fmt_hms(duration),
         description=(info.get("description") or "")[:8000],
@@ -1663,8 +1691,8 @@ def build_pi_oneshot_cmd(pi_bin: str, model: str, effort: str,
     if pi_supports_effort(pi_bin, env):
         cmd += ["--effort", effort]
     if pi_supports_tools(pi_bin, env):
-        # the segment task only needs read (prompt/frames/keyframes.json) and
-        # bash (ffprobe/ffmpeg/compare); never the write/edit tools
+        # the segment task only needs read (prompt/frames/keyframes.json/
+        # silences.json) and bash (ffprobe/ffmpeg/compare); never the write/edit tools
         cmd += ["--tools", "read,bash"]
     return cmd
 
